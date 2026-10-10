@@ -18,6 +18,6 @@ for artifact in kagitaba-app kagitaba-app-x86_64-unknown-linux-gnu.tar.gz sbom.s
   gh attestation verify "$artifact" "${policy[@]}" --bundle provenance.sigstore.json
 done
 gh attestation verify kagitaba-app "${policy[@]}" --bundle sbom.sigstore.json \
-  --predicate-type https://spdx.dev/Document
+  --predicate-type https://spdx.dev/Document/v2.3
 sha256sum --strict --check SHA256SUMS
 echo "Verified build provenance, SBOM attestation, and checksums for $expected_commit"
