@@ -1,0 +1,26 @@
+[package]
+name = "kagitaba-app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+smoke = ["eframe/__screenshot"]
+
+[dependencies]
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+data-encoding = { version = "2.11.1", default-features = false }
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui-file-dialog = { version = "0.15.0", default-features = false }
+futures = { version = "0.3.34", default-features = false, features = ["executor"] }
+hex = "0.4.3"
+hmac = "0.13.0"
+kagitaba-core = { version = "0.1.0", path = "../.." }
+kagitaba-cxf = { version = "0.1.0", path = "../kagitaba-cxf", features = ["keepass"] }
+kagitaba-device = { version = "0.1.0", path = "../kagitaba-device" }
+kagitaba-store = { version = "0.1.0", path = "../kagitaba-store" }
+rand = { version = "0.10.3", default-features = false, features = ["sys_rng"] }
+serde_json = { version = "1.0.151", default-features = false }
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+zeroize = { version = "1.9.1", default-features = false }

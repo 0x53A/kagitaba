@@ -1,0 +1,83 @@
+name: Build and attest Linux app
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: kagitaba-attested-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == '0x53A/kagitaba' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: '0.11.21'
+          enable-cache: false
+      - name: Install Rust and native build prerequisites
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy --target wasm32-unknown-unknown
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends libxkbcommon-dev libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev pkg-config
+      - name: Check before signing
+        run: |
+          cargo test --locked --workspace --all-features
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          cargo check --locked -p kagitaba-core -p kagitaba-cxf --target wasm32-unknown-unknown --lib
+          uv run --no-project --python 3.12 -m unittest discover -s tools -p 'test_*.py'
+      - name: Build exact binary and SBOM
+        run: uv run --no-project --python 3.12 tools/build_release.py
+      - name: Validate SPDX document independently
+        run: uvx --from spdx-tools==0.8.5 pyspdxtools -i target/dist/sbom.spdx.json
+      - name: Attest build provenance of all distribution files
+        id: provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: target/dist/*
+      - name: Bind SBOM to executable and archive
+        id: sbom
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            target/dist/kagitaba-app
+            target/dist/kagitaba-app-x86_64-unknown-linux-gnu.tar.gz
+          sbom-path: target/dist/sbom.spdx.json
+      - name: Preserve and verify signed evidence
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "$PROVENANCE_BUNDLE" target/dist/provenance.sigstore.json
+          cp "$SBOM_BUNDLE" target/dist/sbom.sigstore.json
+          bash tools/verify-release.sh target/dist "$GITHUB_SHA"
+          {
+            echo '### Attested Linux build'
+            echo "Source: $GITHUB_SHA"
+            echo '```text'
+            cat target/dist/SHA256SUMS
+            sha256sum target/dist/kagitaba-app-x86_64-unknown-linux-gnu.tar.gz
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve binary, SBOM, and attestations
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kagitaba-linux-x86_64-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/dist/
+          if-no-files-found: error
+          retention-days: 90

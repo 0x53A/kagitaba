@@ -1,0 +1,25 @@
+[package]
+name = "kagitaba-core"
+version = "0.1.0"
+edition = "2024"
+description = "In-memory cryptography and immutable wallet records for Kagitaba"
+publish = false
+
+[workspace]
+members = ["crates/kagitaba-app","crates/kagitaba-cxf", "crates/kagitaba-device", "crates/kagitaba-store"]
+default-members = [".", "crates/kagitaba-cxf"]
+resolver = "3"
+
+[dependencies]
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
+hex = "0.4.3"
+hkdf = "0.13.0"
+p256 = { version = "0.14.0", default-features = false, features = ["ecdh", "pem", "alloc"] }
+rand_core = "0.10.1"
+sha2 = { version = "0.11.0", features = ["zeroize"] }
+thiserror = "2.0.21"
+zeroize = "1.9.1"
+
+[dev-dependencies]
+futures = "0.3.34"
+rand_chacha = "0.10.0"

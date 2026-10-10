@@ -1,0 +1,46 @@
+name: Check
+on:
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: '0.11.21'
+          enable-cache: false
+      - name: Install Rust and native build prerequisites
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy --target wasm32-unknown-unknown
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends libxkbcommon-dev libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev pkg-config
+      - name: Check workspace and portable crates
+        run: |
+          cargo test --locked --workspace --all-features
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          cargo check --locked -p kagitaba-core -p kagitaba-cxf --target wasm32-unknown-unknown --lib
+          uv run --no-project --python 3.12 -m unittest discover -s tools -p 'test_*.py'
+      - name: Build app with mandatory SBOM capture
+        run: uv run --no-project --python 3.12 tools/build_release.py
+      - name: Validate SPDX document independently
+        run: uvx --from spdx-tools==0.8.5 pyspdxtools -i target/dist/sbom.spdx.json
+      - name: Preserve unsigned PR inventory for review
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kagitaba-unsigned-pr-sbom-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/dist/sbom.spdx.json
+            target/dist/cargo-sbom.json
+            target/dist/licenses.json
+            target/dist/build-info.json
+          if-no-files-found: error
+          retention-days: 30
