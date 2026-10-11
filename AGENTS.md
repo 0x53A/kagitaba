@@ -18,8 +18,8 @@ without explicit instruction.
    application-specific retrieval metadata. This layer does not assume that its
    body can be decrypted by the local crypto module. Zero grants are legal for
    other retrieval backends. Structured validation is not authentication.
-3. Applications: Linux native client; an Android APK with Kotlin UI and JNI into
-   Rust remains future work. Own file layout, trusted-key enrolment, signing, sync, schema,
+3. Applications: Linux native client, standalone Firefox extension, and Android
+   Kotlin/JNI client (see `android/AGENTS.md`). Own file layout, trusted-key enrolment, signing, sync, schema,
    caches, imports, random sources, hardware access, and interpretation of bodies.
 
 Rust WASM compatibility is a requirement for a later PWA. Core randomness is
@@ -52,6 +52,31 @@ Entry IDs and revision IDs are independent random 16-byte values (32 hex digits)
 There is no mandatory wallet ID or global manifest. Catalogue/search indexes are
 reconstructable app caches. Public key registration alone grants no entry access.
 
+Optional participant metadata is an ordinary encrypted entry. Its public pointer
+`participants/<key-id>/meta.entry` contains the canonical 32-hex entry ID plus LF.
+Pointers must reference existing entries, belong to enrolled participants and be
+unique. The encrypted UTF-8 JSON object has `format: "kagitaba-participant-metadata"`,
+`version: 1`, `entryId`, `participantId`, and optional `name`. Both IDs are bound
+and checked after decryption. Application schema lives in kagitaba-cxf alongside,
+but separate from, CXF payloads; the opaque core has no metadata semantics.
+JSON is limited to 16 KiB, rejects duplicate members and preserves unknown fields.
+Names allow 128 Unicode scalar values / 512 UTF-8 bytes, no surrounding whitespace,
+controls or bidi override/isolate controls. Clearing a name preserves the entry
+and other metadata. Names are display hints; always show a fingerprint too.
+Metadata entries are excluded from credential lists/providers and decrypted only
+after unlock; lock clears names and suppresses late name results.
+
+Metadata is granted to all participants. Enrolment adds missing grants without
+rewriting primary or existing grant bytes. Revocation deletes the departing
+participant's metadata and rotates remaining metadata with the other affected
+entries. Historical names remain readable to historical recipients. Public
+YubiKey serial/slot routing stays in device.json for Connect. Browser unlock
+parameters and its encrypted software identity remain installation-local and
+are omitted from participant requests and exports. Reinstallation creates a new
+participant; no same-identity recovery flow. Legacy name.json/browser.json remain
+readable for signed-history compatibility; ordinary app writes encrypt legacy
+names and prune browser.json. Historical commits are never rewritten.
+
 Each encrypted content revision gets a fresh random 32-byte content key and a
 fresh revision ID. Each authorised participant gets a detached wrapped copy of
 that same content key. All grants bind the exact primary record's digest.
@@ -63,14 +88,98 @@ omit the removed participant. Old snapshots remain readable by their recipients.
 The opaque middle layer cannot prove that an app used a fresh encryption key;
 it enforces revision changes and grant associations, not plaintext semantics.
 
-Initially the app will accept only linear, signed Git history and fast-forward
-from an already trusted snapshot. Signature verification must authorise the signer,
-not merely check mathematical validity. Verify committed bytes, not a mutable
-working tree. Bootstrap trust/rollback handling remain app work. No merges yet.
-This policy is not part of the core. Concurrent changes/semantic merge UI are
-deferred. A stale grant is rejected, never silently copied onto a new revision.
+The app accepts signed history descending from an already trusted snapshot,
+including explicitly created conservative two-parent merges. Verify committed
+bytes and authorize every signer; mathematical signature validity alone is not
+enough. Both branches must share the exact genesis and have one unambiguous merge
+base. Reject unrelated roots, redundant/duplicate parents, octopus merges and
+criss-cross histories with multiple best bases. A merge signer must be enrolled
+in BOTH parent snapshots. Verify every reachable commit and accept a checkpoint
+on either ancestry path; no rebase, force push or checkpoint reset is needed.
+
+Three-way merging treats each entry (primary plus complete grant set) and each
+participant (encryption/signing keys plus device metadata and meta.entry) as an atomic
+unit of committed bytes. One-sided or identical changes combine; different
+concurrent changes, including edit/delete, conflict. A collection tree remains
+one entry. Deletions are preserved; no field-level credential merge, credential grant union,
+timestamp winner, or automatic conflict resolution. Validate the resulting
+snapshot and revision transitions against BOTH parents. Received merge commits
+must contain exactly this result; an authorized signature does not excuse a
+merge dropping or adding changes. A stale grant is never copied onto a new
+revision. This history policy belongs to applications, not the opaque core.
+Participant metadata has a narrow exception: independent additive grants merge
+when the base primary and grants are unchanged. A new metadata revision concurrent
+with only additive grants takes the new revision and its matching grants; obsolete
+grants are never carried over. Competing revisions and removals conflict. When
+both sides add different randomized wrappers for the same recipient, omit that
+grant from the clean merge and recreate it in the follow-up. A merged metadata pointer cannot dangle or
+leave its old metadata entry orphaned. New membership can leave metadata missing
+grants in the clean merge snapshot: this intermediate commit is valid. Native
+merge then adds missing grants in a separate signed child commit, preserving the
+clean merge bytes. Prepare and verify both commits before one accepted-head
+update; grant/signing failure publishes neither. If no grants need adding, no
+extra commit is needed. All clients verify both commits normally.
+Native merge creation requires an explicit action and signing; ordinary updates
+only accept verified descendants. Firefox and Android accept these merged
+histories; their automatic sync still refuses to create a merge on divergence.
+Bootstrap trust/rollback handling and semantic conflict UI remain app work.
 Optional master recipients, per-participant ownership signatures, proxy
 re-encryption, and standalone authorisation records are deferred.
+
+## Agreed participant index design (not yet implemented)
+
+Persist each participant's reconstructable encrypted index at `/cache/<p>/index`
+(paths are wallet-root-relative). The repository holds the index and its wrapped
+key so they travel with clones, backups and sync. Entries and grants remain
+authoritative; a missing index is rebuilt by its participant after unlock.
+Listing should decrypt the index once, then decrypt individual entries only when
+opened/used or when their index rows need rebuilding. Index rows contain entry
+IDs, primary digests, titles, account/usernames, URLs/scopes and presence flags
+for password, TOTP and passkey credentials. Support multiple usernames/scopes;
+presence does not imply that a preserved credential type is supported for use.
+
+Generate one random index key per participant, wrap it exclusively to that
+participant, and persist the wrapper outside the disposable cache, provisionally
+at `participants/<p>/index-key`. Provision and sync this key before independent
+rebuilds; independently generated keys cannot produce identical indexes. The key
+belongs to authoritative participant metadata and is removed on revocation.
+Cache invalidation must not delete or regenerate it. Use AES-SIV deterministic
+authenticated encryption (RFC 5297) in a separate versioned cache format; do not
+fix nonces or alter the existing entry/wrapped-key wire formats. Canonical
+plaintext and associated data must produce identical bytes across clients for
+the same key and relevant snapshot. Specify extraction rules, ordering,
+serialization and schema version; exclude timestamps and machine-specific data.
+Identical ciphertext deliberately reveals equality of index versions.
+
+Use a fingerprint of canonical sorted relevant snapshot data (entry IDs, primary
+digests and this participant's grants), computed from the verified snapshot,
+instead of embedding the current Git commit as the validity marker. Unrelated
+commits and cache-only commits must not invalidate the index or trigger write
+loops. Newly accessible entries and changed accessible primaries require
+decryption; deleted entries or removed own grants drop rows without decryption.
+Changes to the participant's own grants must be detected; changes only to other
+participants' grants do not require rebuilding rows. Persist refreshes through
+normal signed writes/sync, batching with ordinary updates where possible; PIV
+signing can still require a touch. External trust checkpoints remain necessary.
+
+Merge each `/cache/<p>/` tree independently of authoritative participant metadata.
+Preserve one-sided or identical changes. Different concurrent changes, including
+edit/delete, omit that participant's entire cache tree from the merged snapshot.
+Removed participants have no cache in the result. Historical commits remain
+unchanged. This is a deterministic merge-verification rule for received commits
+as well as locally created merges; cache conflicts never block a merge, while
+authoritative data keeps its existing conflict rules. All wallet readers must
+support the new paths before writers introduce them; current readers reject
+unknown paths. Exact cache wire encoding and bounds remain implementation work.
+
+## Future Linux passkey provider
+
+An application-owned `/dev/uhid` CTAP2 authenticator could expose native wallet
+passkeys to Firefox and Chromium without a passkey browser extension. With a
+physical YubiKey present, select Kagitaba first, let the browser cancel its device
+selection request to the physical key, then request the PIV touch for decryption.
+Test this ordering so unlocking the wallet does not select the wrong website
+authenticator. This is a design note, not implemented Linux functionality.
 
 ## Application payload schema and CXF import
 
@@ -106,7 +215,7 @@ There may be zero or more root collections. Each root and its embedded descendan
 form one atomic update unit: an edit creates a fresh entry revision, content key,
 and matching grants. Different roots are independent entries. Logical merging of
 concurrent edits to the same root requires explicit application support; initial
-linear-history handling does not attempt it. Items may exist outside collections.
+history handling rejects such conflicts. Items may exist outside collections.
 
 Application plaintext envelope (fully encrypted inside a core Ciphertext):
 
@@ -298,6 +407,12 @@ best-effort memory hygiene, not protection against a compromised running process
 all compiler/register copies, or caller-created plaintext copies.
 
 ## Development and checks
+
+Standalone Firefox extension design and implementation acceptance criteria:
+`FIREFOX-DESIGN.md`. Each installation is a separate software participant,
+unlocked through a physical key's WebAuthn PRF and operating on its own encrypted
+replica. Keep implementation status and browser-specific operating instructions
+with the extension; the design document is not evidence of completed validation.
 
 Use the project `shell.nix` (`.envrc` contains `use nix`). System Rust executables
 are rustup shims without a configured default. Use cargo to change dependencies.

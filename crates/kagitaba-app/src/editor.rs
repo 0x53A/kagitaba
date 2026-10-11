@@ -247,11 +247,25 @@ fn field(
     };
     let mut edited = Zeroizing::new(text.to_owned());
     let mut changed = false;
+    ui.label(label);
     ui.horizontal(|ui| {
-        ui.label(label);
+        let reveal_id = ui.id().with(("reveal-field", label));
+        let mut revealed = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<bool>(reveal_id).unwrap_or(false));
+        let width = (ui.available_width() - if secret { 145.0 } else { 72.0 }).max(60.0);
         changed = ui
-            .add(egui::TextEdit::singleline(&mut *edited).password(secret))
+            .add(
+                egui::TextEdit::singleline(&mut *edited)
+                    .password(secret && !revealed)
+                    .desired_width(width),
+            )
             .changed();
+        if secret && ui.button(if revealed { "Hide" } else { "Show" }).clicked() {
+            revealed = !revealed;
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(reveal_id, revealed));
+        }
         if ui.button("Copy").clicked() {
             *status = Some(
                 if clip.copy(&edited) {

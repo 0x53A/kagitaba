@@ -1,14 +1,24 @@
-//! Signed, linear Git wallet storage. No working tree is trusted or decrypted.
+//! Signed Git wallet storage with conservative merges. No working tree is trusted or decrypted.
 #![forbid(unsafe_code)]
+mod device_hint;
+mod history;
+mod participant_name;
+mod metadata;
+#[cfg(test)]
+mod history_tests;
 mod signing;
+mod transfer;
+mod worktree;
+pub use device_hint::DeviceHint;
+pub use participant_name::validate_name;
+use history::{history, merge_files, verify_history};
 use gix::{
-    ObjectId,
     objs::{
         WriteTo,
         tree::{Entry as TreeEntry, EntryKind},
     },
-    refs::transaction::PreviousValue,
 };
+pub use gix::ObjectId;
 use kagitaba_core::{
     EntryId, KeyId,
     crypto::PublicKey,
@@ -30,10 +40,32 @@ pub enum Error {
     Io,
     #[error("invalid or oversized wallet repository")]
     Invalid,
+    #[error(
+        "destination folder is not empty; choose a new empty folder, or use Open wallet for an existing wallet"
+    )]
+    DestinationNotEmpty,
+    #[error(
+        "wallet working tree or index has local changes, conflicting files, or unsafe paths; resolve them before saving"
+    )]
+    DirtyWorktree,
+    #[error("check out the wallet branch before saving from Kagitaba")]
+    WrongBranch,
+    #[error("wallet working tree is locked by another Git operation")]
+    WorktreeLocked,
     #[error("wallet signature is missing, invalid, or unauthorized")]
     Signature,
-    #[error("history is not linear or does not descend from the trusted checkpoint")]
+    #[error("unsupported wallet history; update clients if this wallet uses newer history rules")]
     History,
+    #[error("incoming history does not contain the trusted checkpoint; histories diverged or an older snapshot was offered")]
+    Checkpoint,
+    #[error("wallet histories have different genesis commits and cannot be merged")]
+    UnrelatedHistory,
+    #[error("wallet histories have multiple merge bases; automatic merging is unsupported")]
+    AmbiguousMergeBase,
+    #[error("participant name must be 1–128 characters, at most 512 bytes, with no surrounding whitespace, controls or bidirectional overrides")]
+    InvalidName,
+    #[error("wallet histories conflict; concurrent entry or participant changes require manual resolution")]
+    Conflict,
     #[error("wallet changed in another process; reload before saving")]
     Stale,
     #[error("hardware signing failed")]
@@ -42,19 +74,64 @@ pub enum Error {
     Core(#[from] kagitaba_core::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryRelation {
+    pub ahead: usize,
+    pub behind: usize,
+}
 #[derive(Clone)]
 pub struct Snapshot {
     pub wallet: Wallet,
     pub signers: BTreeMap<KeyId, PublicKey>,
+    pub devices: BTreeMap<KeyId, DeviceHint>,
+    /// Legacy recovery packages: read for history compatibility, pruned on writes.
+    pub browsers: BTreeMap<KeyId, serde_json::Value>,
+    /// Legacy public labels: migrate to encrypted metadata before writing.
+    pub names: BTreeMap<KeyId, String>,
+    /// Public pointers to encrypted participant metadata entries.
+    pub metadata: BTreeMap<KeyId, EntryId>,
 }
 impl Snapshot {
     pub fn empty(encryption: PublicKey, signing: PublicKey) -> Result<Self> {
         Ok(Self {
+            metadata: BTreeMap::new(),
+            names: BTreeMap::new(),
+            devices: BTreeMap::new(),
+            browsers: BTreeMap::new(),
             signers: BTreeMap::from([(encryption.id(), signing)]),
             wallet: Wallet::from_parts([encryption], [])?,
         })
     }
     pub fn validate(&self) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (participant, entry) in &self.metadata {
+            if !self.wallet.participants().contains_key(participant)
+                || !self.wallet.entries().contains_key(entry)
+                || !seen.insert(entry)
+                || self.names.contains_key(participant)
+            {
+                return Err(Error::Invalid);
+            }
+        }
+        for (id, name) in &self.names {
+            validate_name(name)?;
+            if !self.wallet.participants().contains_key(id) {
+                return Err(Error::Invalid);
+            }
+        }
+        for (id, metadata) in &self.browsers {
+            transfer::validate_browser(
+                metadata,
+                self.wallet.participants().get(id).ok_or(Error::Invalid)?,
+                self.signers.get(id).ok_or(Error::Invalid)?,
+            )?;
+        }
+        for (id, hint) in &self.devices {
+            if !self.wallet.participants().contains_key(id) {
+                return Err(Error::Invalid);
+            }
+            hint.validate()?;
+        }
         if self.signers.len() != self.wallet.participants().len()
             || self
                 .signers
@@ -74,26 +151,15 @@ pub struct Store {
     pub root_signer: PublicKey,
 }
 impl Store {
-    /// Only initializes an absent or empty directory explicitly selected by caller.
+    /// Initializes a normal repository in an empty directory or unused `git init` repository.
     pub fn create(path: &Path, snapshot: Snapshot, signer: &impl Signer) -> Result<Self> {
         snapshot.validate()?;
-        if path.exists()
-            && std::fs::read_dir(path)
-                .map_err(|_| Error::Io)?
-                .next()
-                .is_some()
-        {
-            return Err(Error::Invalid);
-        }
         if !snapshot.signers.values().any(|p| p == signer.public_key()) {
             return Err(Error::Signature);
         }
-        let repo = gix::init_bare(path).map_err(|_| Error::Io)?;
+        let repo = worktree::initialize(path)?;
         let head = write_commit(&repo, None, &snapshot, signer, "Create wallet")?;
-        repo.reference(BRANCH, head, PreviousValue::MustNotExist, "Create wallet")
-            .map_err(|_| Error::Stale)?;
-        // This is the newly created, app-owned bare wallet, never the source checkout.
-        std::fs::write(path.join("HEAD"), format!("ref: {BRANCH}\n")).map_err(|_| Error::Io)?;
+        publish(&repo, None, head, "Create wallet")?;
         Ok(Self {
             repo,
             path: path.to_owned(),
@@ -130,14 +196,7 @@ impl Store {
             return Err(Error::Signature);
         }
         let new = write_commit(&self.repo, Some(self.head), &next, signer, message)?;
-        self.repo
-            .reference(
-                BRANCH,
-                new,
-                PreviousValue::MustExistAndMatch(gix::refs::Target::Object(self.head)),
-                message,
-            )
-            .map_err(|_| Error::Stale)?;
+        publish(&self.repo, Some(self.head), new, message)?;
         self.head = new;
         self.snapshot = next;
         Ok(())
@@ -146,19 +205,20 @@ impl Store {
     /// Verify every incoming commit before updating the accepted wallet branch.
     pub fn accept(&mut self, candidate: ObjectId) -> Result<()> {
         let next = verify_history(&self.repo, candidate, &self.root_signer, Some(self.head))?;
-        self.repo
-            .reference(
-                BRANCH,
-                candidate,
-                PreviousValue::MustExistAndMatch(gix::refs::Target::Object(self.head)),
-                "Accept verified updates",
-            )
-            .map_err(|_| Error::Stale)?;
+        if branch(&self.repo)? != self.head {
+            return Err(Error::Stale);
+        }
+        publish(
+            &self.repo,
+            Some(self.head),
+            candidate,
+            "Accept verified updates",
+        )?;
         self.head = candidate;
         self.snapshot = next;
         Ok(())
     }
-    /// Pull a local replica only after verifying authorized linear history back
+    /// Pull a local replica only after verifying authorized history back
     /// to this wallet's trusted checkpoint.
     pub fn pull_from(&mut self, path: &Path) -> Result<()> {
         let source = gix::open(path).map_err(|_| Error::Io)?;
@@ -167,39 +227,186 @@ impl Store {
         copy_objects(&source, &self.repo, head)?;
         self.accept(head)
     }
+    /// Explicitly merge an already-fetched commit. Independent changes only;
+    /// the signer must be authorized in both parents. No plaintext is needed.
+    pub fn merge(&mut self, candidate: ObjectId, signer: &impl Signer) -> Result<()> {
+        self.merge_then(candidate, signer, |_| Ok(false))
+    }
+    /// Build a clean merge and optionally a signed application-maintenance child.
+    /// Both signatures and final verification precede the single ref/checkout update.
+    pub fn merge_then(&mut self, candidate: ObjectId, signer: &impl Signer, repair: impl FnOnce(&mut Snapshot) -> Result<bool>) -> Result<()> {
+        verify_history(&self.repo, self.head, &self.root_signer, Some(self.head))?;
+        let incoming = verify_history(&self.repo, candidate, &self.root_signer, None)?;
+        let graph = history(&self.repo, candidate)?;
+        if graph.iter().any(|(id, _)| *id == self.head) {
+            return self.publish_repaired(candidate, incoming, signer, repair);
+        }
+        let local = history(&self.repo, self.head)?;
+        if local.iter().any(|(id, _)| *id == candidate) {
+            if branch(&self.repo)? != self.head {
+                return Err(Error::Stale);
+            }
+            return self.publish_repaired(self.head, self.snapshot.clone(), signer, repair);
+        }
+        if ![&self.snapshot, &incoming].iter().all(|snapshot| {
+            snapshot
+                .signers
+                .values()
+                .any(|key| key == signer.public_key())
+        }) {
+            return Err(Error::Signature);
+        }
+        let graph = local.into_iter().chain(graph).collect();
+        let merged = merge_files(&self.repo, &graph, self.head, candidate)?;
+        let tree = write_tree(&self.repo, &merged)?;
+        let next = read_snapshot(&self.repo, tree)?;
+        validate_transition(&self.snapshot, &next)?;
+        validate_transition(&incoming, &next)?;
+        if branch(&self.repo)? != self.head {
+            return Err(Error::Stale);
+        }
+        let head = write_commit_tree(
+            &self.repo,
+            &[self.head, candidate],
+            tree,
+            signer,
+            "Merge independent wallet changes",
+        )?;
+        self.publish_repaired(head, next, signer, repair)
+    }
+    fn publish_repaired(&mut self, mut head: ObjectId, mut next: Snapshot, signer: &impl Signer, repair: impl FnOnce(&mut Snapshot) -> Result<bool>) -> Result<()> {
+        let clean = next.clone();
+        if repair(&mut next)? {
+            next.validate()?;
+            validate_transition(&clean, &next)?;
+            if !clean.signers.values().any(|key| key == signer.public_key()) { return Err(Error::Signature); }
+            head = write_commit(&self.repo, Some(head), &next, signer, "Complete participant metadata grants")?;
+        }
+        verify_history(&self.repo, head, &self.root_signer, Some(self.head))?;
+        if head == self.head { return Ok(()); }
+        publish(
+            &self.repo,
+            Some(self.head),
+            head,
+            "Merge verified histories",
+        )?;
+        self.head = head;
+        self.snapshot = next;
+        Ok(())
+    }
+    /// Merge a local replica after authenticating its complete history.
+    pub fn merge_from(&mut self, path: &Path, signer: &impl Signer) -> Result<()> {
+        let head = self.import_candidate(path)?;
+        self.merge(head, signer)
+    }
+    /// Copy verified local history without advancing the accepted branch.
+    pub fn import_candidate(&self, path: &Path) -> Result<ObjectId> {
+        let source = gix::open(path).map_err(|_| Error::Io)?;
+        let head = branch(&source)?;
+        verify_history(&source, head, &self.root_signer, None)?;
+        copy_objects(&source, &self.repo, head)?;
+        Ok(head)
+    }
+    /// Merge the cached origin/wallet ref; performs no network fetch or push.
+    pub fn merge_origin(&mut self, signer: &impl Signer) -> Result<()> {
+        self.merge(self.origin_head()?, signer)
+    }
+    /// The cached remote ref is untrusted until verified by relation/accept/merge.
+    pub fn origin_head(&self) -> Result<ObjectId> {
+        self.repo
+            .find_reference("refs/remotes/origin/wallet")
+            .map_err(|_| Error::Invalid)?
+            .try_id()
+            .ok_or(Error::Invalid)
+            .map(|id| id.detach())
+    }
+    /// Verify a candidate and compare its complete DAG with the accepted history.
+    /// Separate genesis commits are unrelated even if signed by the same key.
+    pub fn relation(&self, candidate: ObjectId) -> Result<HistoryRelation> {
+        verify_history(&self.repo, candidate, &self.root_signer, None)?;
+        let local = history(&self.repo, self.head)?;
+        let remote = history(&self.repo, candidate)?;
+        if local.first().map(|(id, _)| id) != remote.first().map(|(id, _)| id) {
+            return Err(Error::UnrelatedHistory);
+        }
+        let a: std::collections::BTreeSet<_> = local.iter().map(|(id, _)| id).collect();
+        let b: std::collections::BTreeSet<_> = remote.iter().map(|(id, _)| id).collect();
+        Ok(HistoryRelation {
+            ahead: a.difference(&b).count(),
+            behind: b.difference(&a).count(),
+        })
+    }
     /// Create an encrypted backup preserving signed history, without private keys.
     pub fn backup_to(&self, path: &Path) -> Result<()> {
-        if path.exists()
-            && std::fs::read_dir(path)
-                .map_err(|_| Error::Io)?
-                .next()
-                .is_some()
-        {
-            return Err(Error::Invalid);
-        }
         verify_history(&self.repo, self.head, &self.root_signer, Some(self.head))?;
-        let target = gix::init_bare(path).map_err(|_| Error::Io)?;
+        let target = worktree::initialize(path)?;
         copy_objects(&self.repo, &target, self.head)?;
-        target
-            .reference(
-                BRANCH,
-                self.head,
-                PreviousValue::MustNotExist,
-                "Verified encrypted backup",
-            )
-            .map_err(|_| Error::Io)?;
-        std::fs::write(path.join("HEAD"), format!("ref: {BRANCH}\n")).map_err(|_| Error::Io)?;
+        publish(&target, None, self.head, "Verified encrypted backup")?;
         Ok(())
     }
     /// Read-only preview of an untrusted genesis signing key for out-of-band comparison.
     pub fn inspect_root(path: &Path) -> Result<PublicKey> {
         let repo = gix::open(path).map_err(|_| Error::Io)?;
         let chain = history(&repo, branch(&repo)?)?;
-        let (_, commit) = chain.last().ok_or(Error::Invalid)?;
+        let (_, commit) = chain.first().ok_or(Error::Invalid)?;
         let sig = signature(commit)?;
         signing::from_ssh(sig.public_key())
     }
 }
+fn publish(
+    repo: &gix::Repository,
+    old: Option<ObjectId>,
+    new: ObjectId,
+    message: &str,
+) -> Result<()> {
+    use gix::refs::{
+        Target,
+        transaction::{PreviousValue, RefEdit},
+    };
+    let name: gix::refs::FullName = BRANCH.try_into().map_err(|_| Error::Invalid)?;
+    let mut edits = vec![RefEdit::update(
+        name.clone(),
+        new,
+        match old {
+            Some(id) => PreviousValue::MustExistAndMatch(Target::Object(id)),
+            None => PreviousValue::MustNotExist,
+        },
+        message,
+    )];
+    if repo.workdir().is_some() {
+        let head = repo
+            .head_name()
+            .map_err(|_| Error::WrongBranch)?
+            .ok_or(Error::WrongBranch)?;
+        if old.is_some() && head != name {
+            return Err(Error::WrongBranch);
+        }
+        edits.push(RefEdit::update(
+            "HEAD".try_into().map_err(|_| Error::Invalid)?,
+            Target::Symbolic(name),
+            PreviousValue::MustExistAndMatch(Target::Symbolic(head)),
+            message,
+        ));
+    }
+    // Lock refs before touching the working tree, including a compare-and-swap
+    // check. A concurrent branch change must never leave a stale checkout behind.
+    let transaction = repo
+        .refs
+        .transaction()
+        .prepare(
+            edits,
+            gix::lock::acquire::Fail::Immediately,
+            gix::lock::acquire::Fail::Immediately,
+        )
+        .map_err(|_| Error::Stale)?;
+    worktree::Update::prepare(repo, old, new)?.apply()?;
+    let actor = commit(repo, new)?.committer;
+    transaction
+        .commit(Some(actor.to_ref(&mut Default::default())))
+        .map_err(|_| Error::Io)?;
+    Ok(())
+}
+
 fn copy_objects(source: &gix::Repository, target: &gix::Repository, head: ObjectId) -> Result<()> {
     use gix::objs::Write;
     let mut pending = vec![head];
@@ -285,61 +492,6 @@ fn commit(repo: &gix::Repository, id: ObjectId) -> Result<gix::objs::Commit> {
     }
     Ok(decoded)
 }
-fn history(repo: &gix::Repository, head: ObjectId) -> Result<Vec<(ObjectId, gix::objs::Commit)>> {
-    let mut chain = Vec::new();
-    let mut id = head;
-    loop {
-        if chain.len() >= 10_000 {
-            return Err(Error::History);
-        }
-        let c = commit(repo, id)?;
-        if c.parents.len() > 1 {
-            return Err(Error::History);
-        }
-        let parent = c.parents.first().copied();
-        chain.push((id, c));
-        match parent {
-            Some(p) => id = p,
-            None => return Ok(chain),
-        }
-    }
-}
-fn verify_history(
-    repo: &gix::Repository,
-    head: ObjectId,
-    root: &PublicKey,
-    checkpoint: Option<ObjectId>,
-) -> Result<Snapshot> {
-    let chain = history(repo, head)?;
-    if checkpoint.is_some_and(|p| !chain.iter().any(|(id, _)| *id == p)) {
-        return Err(Error::History);
-    }
-    let mut previous: Option<Snapshot> = None;
-    for (_, mut c) in chain.into_iter().rev() {
-        let sig = signature(&c)?;
-        let key = signing::from_ssh(sig.public_key())?;
-        let authorized = match &previous {
-            None => &key == root,
-            Some(p) => p.signers.values().any(|k| k == &key),
-        };
-        if !authorized {
-            return Err(Error::Signature);
-        }
-        c.extra_headers.clear();
-        ssh_public(&key)?
-            .verify("git", &bytes(&c)?, &sig)
-            .map_err(|_| Error::Signature)?;
-        let current = read_snapshot(repo, c.tree)?;
-        if let Some(old) = &previous {
-            validate_transition(old, &current)?;
-        }
-        if previous.is_none() && !current.signers.values().any(|k| k == root) {
-            return Err(Error::Signature);
-        }
-        previous = Some(current);
-    }
-    previous.ok_or(Error::Invalid)
-}
 fn validate_transition(old: &Snapshot, new: &Snapshot) -> Result<()> {
     for (id, entry) in new.wallet.entries() {
         if let Some(previous) = old.wallet.entries().get(id)
@@ -373,6 +525,21 @@ fn write_commit(
     message: &str,
 ) -> Result<ObjectId> {
     let tree = write_tree(repo, &files(snapshot)?)?;
+    write_commit_tree(
+        repo,
+        &parent.into_iter().collect::<Vec<_>>(),
+        tree,
+        signer,
+        message,
+    )
+}
+fn write_commit_tree(
+    repo: &gix::Repository,
+    parents: &[ObjectId],
+    tree: ObjectId,
+    signer: &impl Signer,
+    message: &str,
+) -> Result<ObjectId> {
     let actor = gix::actor::Signature {
         name: "Kagitaba".into(),
         email: "wallet@localhost".into(),
@@ -386,7 +553,7 @@ fn write_commit(
     };
     let mut c = gix::objs::Commit {
         tree,
-        parents: parent.into_iter().collect(),
+        parents: parents.iter().copied().collect(),
         author: actor.clone(),
         committer: actor,
         encoding: None,
@@ -412,6 +579,24 @@ fn files(snapshot: &Snapshot) -> Result<Files> {
             format!("participants/{id}/sign.pem"),
             snapshot.signers[id].to_pem().into_bytes(),
         );
+        if let Some(hint) = snapshot.devices.get(id) {
+            files.insert(format!("participants/{id}/device.json"), hint.to_json()?);
+        }
+        if let Some(entry) = snapshot.metadata.get(id) {
+            files.insert(format!("participants/{id}/meta.entry"), format!("{entry}\n").into_bytes());
+        }
+        if let Some(name) = snapshot.names.get(id) {
+            files.insert(
+                format!("participants/{id}/name.json"),
+                participant_name::to_json(name)?,
+            );
+        }
+        if let Some(browser) = snapshot.browsers.get(id) {
+            files.insert(
+                format!("participants/{id}/browser.json"),
+                serde_json::to_vec(browser).map_err(|_| Error::Invalid)?,
+            );
+        }
     }
     for (id, entry) in snapshot.wallet.entries() {
         files.insert(format!("entries/{id}/primary"), entry.primary().to_bytes());
@@ -523,19 +708,49 @@ fn read_tree(
     Ok(())
 }
 fn read_snapshot(repo: &gix::Repository, tree: ObjectId) -> Result<Snapshot> {
+    snapshot_from_files(read_files(repo, tree)?)
+}
+fn read_files(repo: &gix::Repository, tree: ObjectId) -> Result<Files> {
     let mut files = Files::new();
     let mut budget = MAX_SNAPSHOT;
     read_tree(repo, tree, "", &mut files, &mut budget, 0)?;
+    Ok(files)
+}
+fn snapshot_from_files(mut files: Files) -> Result<Snapshot> {
     if files.remove("kagitaba-format").as_deref() != Some(b"1\n") {
         return Err(Error::Invalid);
     }
     let mut keys = BTreeMap::new();
     let mut signers = BTreeMap::new();
+    let mut devices = BTreeMap::new();
+    let mut browsers = BTreeMap::new();
+    let mut names = BTreeMap::new();
+    let mut metadata = BTreeMap::new();
     let mut primaries = BTreeMap::new();
     let mut grants: BTreeMap<EntryId, Vec<GrantRecord>> = BTreeMap::new();
     for (path, data) in files {
         let parts: Vec<_> = path.split('/').collect();
         match parts.as_slice() {
+            ["participants", id, "meta.entry"] => {
+                let text = std::str::from_utf8(&data).map_err(|_| Error::Invalid)?;
+                let entry = text.strip_suffix('\n').ok_or(Error::Invalid)?.parse()?;
+                metadata.insert(id.parse()?, entry);
+            }
+            ["participants", id, "name.json"] => {
+                names.insert(id.parse()?, participant_name::from_json(&data)?);
+            }
+            ["participants", id, "browser.json"] => {
+                if data.len() > 65536 {
+                    return Err(Error::Invalid);
+                }
+                browsers.insert(
+                    id.parse()?,
+                    serde_json::from_slice(&data).map_err(|_| Error::Invalid)?,
+                );
+            }
+            ["participants", id, "device.json"] => {
+                devices.insert(id.parse()?, DeviceHint::from_json(&data)?);
+            }
             ["participants", id, file @ ("pub.pem" | "sign.pem")] => {
                 let id: KeyId = id.parse()?;
                 let key =
@@ -580,6 +795,10 @@ fn read_snapshot(repo: &gix::Repository, tree: ObjectId) -> Result<Snapshot> {
         return Err(Error::Invalid);
     }
     let snapshot = Snapshot {
+        metadata,
+        names,
+        browsers,
+        devices,
         wallet: Wallet::from_parts(keys.into_values(), entries)?,
         signers,
     };

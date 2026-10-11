@@ -1,0 +1,7 @@
+/.gradle/
+/.kotlin/
+/build/
+/app/build/
+/autofill-probe/build/
+/app/src/main/jniLibs/
+/local.properties

@@ -9,11 +9,15 @@ aes = { version = "0.9.3", features = ["zeroize"] }
 des = { version = "0.9.0", features = ["zeroize"] }
 hex = "0.4.3"
 kagitaba-core = { version = "0.1.0", path = "../.." }
-nusb = "0.2.7"
+nusb = { version = "0.2.7", optional = true }
 p256 = { version = "0.14.0", features = ["ecdsa", "pem"] }
 sha2 = "0.11.0"
 thiserror = "2.0.21"
 zeroize = "1.9.1"
+
+[features]
+default = ["usb"]
+usb = ["dep:nusb"]
 
 [dev-dependencies]
 futures = "0.3.34"

@@ -35,6 +35,17 @@ fn pin_padding_and_single_attempt_failure() {
     assert!(matches!(card.verify_pin("123456"), Err(Error::Pin(2))));
 }
 #[test]
+fn serial_number_is_read_without_authentication_and_requires_four_bytes() {
+    let mut card = script(vec![(vec![0, 0xf8, 0, 0], vec![1, 2, 3, 4, 0x90, 0])]);
+    assert_eq!(card.serial_number().unwrap(), 0x01020304);
+    for length in [0, 3, 5] {
+        let mut response = vec![0; length];
+        response.extend([0x90, 0]);
+        let mut card = script(vec![(vec![0, 0xf8, 0, 0], response)]);
+        assert!(matches!(card.serial_number(), Err(Error::Protocol)));
+    }
+}
+#[test]
 fn blocked_pin_and_invalid_input_do_not_retry() {
     let mut card = script(vec![(
         vec![
@@ -61,7 +72,7 @@ fn provisioning_never_overwrites_occupied_or_unknown_slots() {
     ));
     assert!(matches!(
         card.generate_empty(0x9a, false),
-        Err(Error::Unsupported)
+        Err(Error::InvalidSlots)
     ));
 }
 #[test]
@@ -120,7 +131,7 @@ fn generation_sets_pin_and_touch_policy_explicitly() {
     let mut response = vec![0x7f, 0x49, 67, 0x86, 65];
     response.extend_from_slice(point.as_bytes());
     response.extend([0x90, 0]);
-    for (slot, touch) in [(0x82, 3), (0x83, 2)] {
+    for (slot, touch) in [(0x82, 3), (0x83, 2), (0x84, 3), (0x95, 2)] {
         let mut card = script(vec![
             (vec![0, 0xf7, 0, slot], vec![0x6a, 0x88]),
             (
@@ -136,6 +147,25 @@ fn generation_sets_pin_and_touch_policy_explicitly() {
 
 #[test]
 fn hardware_session_unwraps_real_envelopes_and_signs_verifiable_messages() {
+    exercise_session(Slots::default());
+    exercise_session(Slots::new(0x95, 0x84).unwrap());
+}
+
+#[test]
+fn slot_selection_rejects_duplicates_and_special_slots() {
+    for encryption in 0u8..=255 {
+        for signing in 0u8..=255 {
+            assert_eq!(
+                Slots::new(encryption, signing).is_ok(),
+                (0x82..=0x95).contains(&encryption)
+                    && (0x82..=0x95).contains(&signing)
+                    && encryption != signing
+            );
+        }
+    }
+}
+
+fn exercise_session(slots: Slots) {
     use kagitaba_core::crypto::{ContentKey, WrappedKey};
     use p256::{
         ecdsa::{
@@ -146,6 +176,7 @@ fn hardware_session_unwraps_real_envelopes_and_signs_verifiable_messages() {
     };
     use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
     struct Card {
+        slots: Slots,
         encryption: p256::SecretKey,
         signing: SigningKey,
         verified: bool,
@@ -159,7 +190,8 @@ fn hardware_session_unwraps_real_envelopes_and_signs_verifiable_messages() {
                     vec![]
                 }
                 0xf7 => {
-                    let point = if apdu[3] == 0x82 {
+                    assert!([self.slots.encryption(), self.slots.signing()].contains(&apdu[3]));
+                    let point = if apdu[3] == self.slots.encryption() {
                         self.encryption.public_key().to_sec1_point(false)
                     } else {
                         self.signing.verifying_key().to_sec1_point(false)
@@ -170,7 +202,8 @@ fn hardware_session_unwraps_real_envelopes_and_signs_verifiable_messages() {
                 }
                 0x87 => {
                     assert!(self.verified);
-                    let value = if apdu[3] == 0x82 {
+                    assert!([self.slots.encryption(), self.slots.signing()].contains(&apdu[3]));
+                    let value = if apdu[3] == self.slots.encryption() {
                         assert_eq!(&apdu[5..11], &[0x7c, 69, 0x82, 0, 0x85, 65]);
                         let peer = p256::PublicKey::from_sec1_bytes(&apdu[11..]).unwrap();
                         p256::ecdh::diffie_hellman(
@@ -197,11 +230,12 @@ fn hardware_session_unwraps_real_envelopes_and_signs_verifiable_messages() {
     let signing = SigningKey::from_slice(&[6; 32]).unwrap();
     let verifier = *signing.verifying_key();
     let card = Card {
+        slots,
         encryption: p256::SecretKey::from_slice(&[8; 32]).unwrap(),
         signing,
         verified: false,
     };
-    let session = Session::unlock(Piv::new(card).unwrap(), "123456").unwrap();
+    let session = Session::unlock_with_slots(Piv::new(card).unwrap(), "123456", slots).unwrap();
     let mut rng = ChaCha20Rng::from_seed([3; 32]);
     let key = ContentKey::generate(&mut rng).unwrap();
     let wrap = WrappedKey::wrap(&key, &session.encryption, b"fixture", &mut rng).unwrap();

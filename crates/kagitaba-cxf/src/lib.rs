@@ -28,12 +28,14 @@ mod json;
 #[cfg(feature = "keepass")]
 pub mod keepass;
 mod payload;
+mod participant;
 
 pub use conversion::{Conversion, ConversionReport, ImportWarning, WarningKind};
 pub use credential_exchange_format as model;
 pub use document::{Document, MAX_DOCUMENT_BYTES};
 pub use import::{ImportPlan, ImportReport};
 pub use payload::{Payload, PayloadKind};
+pub use participant::ParticipantMetadata;
 
 /// Failures contain neither source JSON nor credential values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

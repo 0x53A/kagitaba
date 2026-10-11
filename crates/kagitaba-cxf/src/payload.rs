@@ -125,6 +125,14 @@ impl Payload {
         json::encode(&self.raw.0)
     }
 
+    /// Apply application edits to a lossless copy, then validate the entire
+    /// envelope again. Failure leaves the original payload untouched.
+    pub fn edited(&self, update: impl FnOnce(&mut Value) -> Result<()>) -> Result<Self> {
+        let mut raw = SecretJson(self.raw.0.clone());
+        update(&mut raw.0)?;
+        Self::from_json(self.entry, &json::encode(&raw.0)?)
+    }
+
     /// Encrypt a new revision with a fresh key and detached grants for exactly
     /// these recipients. This also implements atomic collection-tree updates.
     pub fn seal(

@@ -1,0 +1,31 @@
+[package]
+name = "kagitaba-browser"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64 = "0.22"
+hex = "0.4"
+hkdf = "0.13"
+hmac = { version = "0.13", features = ["zeroize"] }
+kagitaba-core = { version = "0.1.0", path = "../.." }
+kagitaba-cxf = { version = "0.1.0", path = "../kagitaba-cxf" }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "pem", "alloc"] }
+rand_core = "0.10"
+serde_json = "1"
+sha1 = "0.11"
+sha2 = "0.11"
+ssh-key = { version = "0.6.7", default-features = false, features = ["alloc", "ecdsa", "p256"] }
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "=0.4.79"
+zeroize = "1"
+
+[dev-dependencies]
+futures = "0.3"
+kagitaba-store = { path = "../kagitaba-store" }
+rand_chacha = "0.10"
+tempfile = "3"

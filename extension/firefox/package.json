@@ -1,0 +1,20 @@
+{
+  "name": "kagitaba-firefox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@isomorphic-git/lightning-fs": "4.6.2",
+    "buffer": "6.0.3",
+    "isomorphic-git": "1.37.3",
+    "tldts": "7.0.25"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "fake-indexeddb": "6.2.4"
+  }
+}

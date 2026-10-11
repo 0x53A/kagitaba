@@ -2,13 +2,13 @@ use futures::executor::block_on;
 use kagitaba_core::{EntryId, KeyId, crypto::PublicKey};
 use kagitaba_cxf::{Document, ImportPlan, Payload};
 use kagitaba_device::{
-    Piv, Session,
+    Piv, Session, Slots,
     usb::{self, Device, Usb},
 };
-use kagitaba_store::{Signer, Snapshot, Store};
+use kagitaba_store::{DeviceHint, Signer, Snapshot, Store};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::mpsc,
@@ -28,15 +28,19 @@ impl Signer for Hardware<'_> {
 }
 pub enum Command {
     Scan,
-    Unlock(Device, Zeroizing<String>),
+    Unlock(Device, Slots, Zeroizing<String>),
     Lock,
-    Provision(Device, Zeroizing<String>, Zeroizing<String>),
+    Close,
+    DiscardImport,
+    RememberDevice,
+    Provision(Device, Slots, Zeroizing<String>, Zeroizing<String>),
     Create(PathBuf),
     Open(PathBuf, Option<String>),
     ExportParticipant(PathBuf),
     AddParticipant(PathBuf),
     Enroll(PublicKey, PublicKey),
     RemoveParticipant(KeyId),
+    NameParticipant(KeyId, String),
     Preview(PathBuf, String, Option<Zeroizing<String>>, Option<PathBuf>),
     Import(Vec<KeyId>),
     Read(EntryId),
@@ -45,13 +49,22 @@ pub enum Command {
     Delete(EntryId),
     Grant(EntryId, Vec<KeyId>),
     Pull(PathBuf),
+    Merge(PathBuf),
+    MergeOrigin,
+    PullRemote(String),
+    MergeRemote(String),
+    Remote(crate::remote::Action),
     Backup(PathBuf),
 }
 pub enum Event {
     Devices(Vec<Device>),
+    DeviceHints(BTreeMap<KeyId, DeviceHint>),
+    ParticipantNames(BTreeMap<KeyId, String>),
+    ParticipantNamesUnavailable,
     Unlocked(String),
     Locked,
     LockComplete,
+    Closed,
     Wallet {
         path: PathBuf,
         entries: Vec<EntryId>,
@@ -64,18 +77,43 @@ pub enum Event {
     Entry(EntryId, Zeroizing<String>, Vec<KeyId>),
     Titles(Vec<(EntryId, Zeroizing<String>)>),
     Done(std::result::Result<(), String>),
+    Remote(crate::remote::Report),
 }
 pub fn start(ctx: eframe::egui::Context) -> (mpsc::Sender<Command>, mpsc::Receiver<Event>) {
     let (tx, rx) = mpsc::channel();
     let (events, out) = mpsc::channel();
     std::thread::spawn(move || {
+        let remote = crate::remote::start(ctx.clone(), events.clone());
         let mut worker = Worker {
             session: None,
+            session_device: None,
             store: None,
             pending: None,
         };
         while let Ok(command) = rx.recv() {
-            let result = worker.run(command, &events).map_err(|e| e.to_string());
+            if let Command::Remote(action) = command {
+                if let Some(store) = &worker.store {
+                    let _ = remote.send(crate::remote::Request {
+                        path: store.path.clone(),
+                        root: store.root_signer.clone(),
+                        checkpoint: store.head.to_string(),
+                        action,
+                    });
+                }
+                continue;
+            }
+            let action = match &command {
+                Command::Create(_) => "Create wallet: ",
+                Command::Open(_, _) => "Open wallet: ",
+                Command::Backup(_) => "Backup wallet: ",
+                Command::Pull(_) => "Pull wallet: ",
+                Command::Merge(_) | Command::MergeOrigin | Command::MergeRemote(_) => "Merge wallet: ",
+                Command::PullRemote(_) => "Pull remote wallet: ",
+                _ => "",
+            };
+            let result = worker
+                .run(command, &events)
+                .map_err(|e| format!("{action}{e}"));
             if result.is_err() && worker.session.is_none() {
                 let _ = events.send(Event::Locked);
             }
@@ -87,16 +125,64 @@ pub fn start(ctx: eframe::egui::Context) -> (mpsc::Sender<Command>, mpsc::Receiv
 }
 struct Worker {
     session: Option<Session<Usb>>,
+    session_device: Option<DeviceHint>,
     store: Option<Store>,
     pending: Option<ImportPlan>,
 }
 impl Worker {
     fn run(&mut self, c: Command, events: &mpsc::Sender<Event>) -> Result<()> {
         match c {
-            Command::Scan => events.send(Event::Devices(usb::devices()?))?,
+            Command::Remote(_) => unreachable!("transport is dispatched separately"),
+            Command::DiscardImport => self.pending = None,
+            Command::Close => {
+                self.session = None;
+                self.session_device = None;
+                self.pending = None;
+                self.store = None;
+                events.send(Event::LockComplete)?;
+                events.send(Event::Closed)?;
+            }
+            Command::Scan => {
+                if self.session.is_some() {
+                    return Err("Lock before refreshing USB devices".into());
+                }
+                events.send(Event::Devices(usb::devices()?))?;
+            }
             Command::Pull(path) => {
                 let store = self.store.as_mut().ok_or("Open a wallet first")?;
                 store.pull_from(&path)?;
+                save_trust(store)?;
+                self.pending = None;
+                self.wallet_event(events)?;
+            }
+            Command::Merge(path) => {
+                let s = self.session.as_ref().ok_or("Unlock a key first")?;
+                let store = self.store.as_mut().ok_or("Open a wallet first")?;
+                let candidate = store.import_candidate(&path)?;
+                merge_metadata(store, candidate, s)?;
+                save_trust(store)?;
+                self.pending = None;
+                self.wallet_event(events)?;
+            }
+            Command::MergeOrigin => {
+                let s = self.session.as_ref().ok_or("Unlock a key first")?;
+                let store = self.store.as_mut().ok_or("Open a wallet first")?;
+                merge_metadata(store, store.origin_head()?, s)?;
+                save_trust(store)?;
+                self.pending = None;
+                self.wallet_event(events)?;
+            }
+            Command::MergeRemote(head) => {
+                let s = self.session.as_ref().ok_or("Unlock a key first")?;
+                let store = self.store.as_mut().ok_or("Open a wallet first")?;
+                merge_metadata(store, kagitaba_store::parse_oid(&head)?, s)?;
+                save_trust(store)?;
+                self.pending = None;
+                self.wallet_event(events)?;
+            }
+            Command::PullRemote(head) => {
+                let store = self.store.as_mut().ok_or("Open a wallet first")?;
+                store.accept(kagitaba_store::parse_oid(&head)?)?;
                 save_trust(store)?;
                 self.pending = None;
                 self.wallet_event(events)?;
@@ -109,20 +195,30 @@ impl Worker {
             }
             Command::Lock => {
                 self.session = None;
+                self.session_device = None;
                 self.pending = None;
                 events.send(Event::LockComplete)?;
             }
-            Command::Unlock(d, pin) => {
+            Command::Unlock(d, slots, pin) => {
                 self.session = None;
-                let s = Session::unlock(Piv::new(Usb::open(&d)?)?, &pin)?;
+                self.session_device = None;
+                let mut card = Piv::new(Usb::open(&d)?)?;
+                let hint = device_hint(&mut card, slots)?;
+                let s = Session::unlock_with_slots(card, &pin, slots)?;
+                if let (Some(store), Some(hint)) = (&self.store, &hint) {
+                    verify_device_hint(&store.snapshot, hint, &s.encryption, &s.signing)?;
+                }
                 events.send(Event::Unlocked(s.encryption.id().to_string()))?;
+                self.session_device = hint;
                 self.session = Some(s);
             }
-            Command::Provision(d, management, pin) => {
+            Command::Provision(d, slots, management, pin) => {
                 self.session = None;
+                self.session_device = None;
                 let mut card = Piv::new(Usb::open(&d)?)?;
+                let hint = device_hint(&mut card, slots)?;
                 // Check both slots before authenticating or generating either key.
-                for slot in [0x82, 0x83] {
+                for slot in [slots.encryption(), slots.signing()] {
                     match card.public_key(slot) {
                         Err(kagitaba_device::Error::Status(0x6a88)) => {}
                         Ok(_) => {
@@ -134,19 +230,36 @@ impl Worker {
                 card.verify_pin(&pin)?;
                 let key = Zeroizing::new(hex::decode(management.trim())?);
                 card.authenticate_management(&key)?;
-                card.generate_empty(0x82, true)?;
-                card.generate_empty(0x83, false)?;
-                let s = Session::unlock(card, &pin)?;
+                card.generate_empty(slots.encryption(), true)?;
+                card.generate_empty(slots.signing(), false)?;
+                let s = Session::unlock_with_slots(card, &pin, slots)?;
                 events.send(Event::Unlocked(s.encryption.id().to_string()))?;
+                self.session_device = hint;
                 self.session = Some(s);
+            }
+            Command::RememberDevice => {
+                let s = self.session.as_ref().ok_or("Unlock a key first")?;
+                let hint = self
+                    .session_device
+                    .clone()
+                    .ok_or("Device serial number unavailable")?;
+                let mut next = self
+                    .store
+                    .as_ref()
+                    .ok_or("Open a wallet first")?
+                    .snapshot
+                    .clone();
+                remember_device(&mut next, hint, &s.encryption, &s.signing)?;
+                self.commit(next, "Remember device slots")?;
+                self.wallet_event(events)?;
             }
             Command::Create(path) => {
                 let s = self.session.as_ref().ok_or("Unlock a key first")?;
-                let store = Store::create(
-                    &path,
-                    Snapshot::empty(s.encryption.clone(), s.signing.clone())?,
-                    &Hardware(s),
-                )?;
+                let mut snapshot = Snapshot::empty(s.encryption.clone(), s.signing.clone())?;
+                if let Some(hint) = &self.session_device {
+                    remember_device(&mut snapshot, hint.clone(), &s.encryption, &s.signing)?;
+                }
+                let store = Store::create(&path, snapshot, &Hardware(s))?;
                 save_trust(&store)?;
                 self.store = Some(store);
                 self.wallet_event(events)?;
@@ -178,6 +291,9 @@ impl Worker {
                 self.store = Some(store);
                 self.pending = None;
                 self.wallet_event(events)?;
+                if self.session.is_none() {
+                    events.send(Event::Devices(usb::devices()?))?;
+                }
             }
             Command::ExportParticipant(path) => {
                 let s = self
@@ -194,7 +310,7 @@ impl Worker {
                 std::io::Write::write_all(&mut f, &bytes)?;
             }
             Command::AddParticipant(path) => {
-                let v: serde_json::Value = serde_json::from_slice(&read_limited(&path, 16384)?)?;
+                let v: serde_json::Value = serde_json::from_slice(&read_limited(&path, 131072)?)?;
                 if v["format"] != "kagitaba-participant-1" {
                     return Err("Invalid participant file".into());
                 }
@@ -237,19 +353,26 @@ impl Worker {
                     return Err("Unknown participant".into());
                 }
                 let mut entries = Vec::new();
+                let removed_metadata = next.metadata.remove(&id);
                 for entry in next.wallet.entries().values() {
+                    if Some(entry.primary().entry_id()) == removed_metadata { continue; }
                     if entry.grants().contains_key(&id) {
                         if !entry.grants().contains_key(&s.encryption.id()) {
                             return Err("This key cannot rotate every affected entry. Grant it access first, or explicitly delete inaccessible entries.".into());
                         }
-                        let payload = block_on(Payload::open(entry, &s.encryption, s))?;
                         let recipients: Vec<_> = entry
                             .grants()
                             .keys()
                             .filter(|p| **p != id)
                             .map(|p| next.wallet.participants()[p].clone())
                             .collect();
-                        entries.push(payload.seal(&recipients, &mut rand::rngs::SysRng)?);
+                        if let Some((participant, _)) = next.metadata.iter().find(|(_, entry_id)| **entry_id == entry.primary().entry_id()) {
+                            let payload = block_on(kagitaba_cxf::ParticipantMetadata::open(entry, *participant, &s.encryption, s))?;
+                            entries.push(payload.seal(&recipients, &mut rand::rngs::SysRng)?);
+                        } else {
+                            let payload = block_on(Payload::open(entry, &s.encryption, s))?;
+                            entries.push(payload.seal(&recipients, &mut rand::rngs::SysRng)?);
+                        }
                     } else {
                         entries.push(entry.clone());
                     }
@@ -263,7 +386,25 @@ impl Worker {
                     entries,
                 )?;
                 next.signers.remove(&id);
+                next.browsers.remove(&id);
+                next.devices.remove(&id);
+                next.names.remove(&id);
                 self.commit(next, "Revoke participant and rotate affected entries")?;
+                self.wallet_event(events)?;
+            }
+            Command::NameParticipant(id, name) => {
+                let mut next = self
+                    .store
+                    .as_ref()
+                    .ok_or("Open a wallet first")?
+                    .snapshot
+                    .clone();
+                if !next.wallet.participants().contains_key(&id) {
+                    return Err("Unknown participant".into());
+                }
+                let s = self.session.as_ref().ok_or("Unlock a key first")?;
+                block_on(next.name_participant(id, &name, &s.encryption, s, &mut rand::rngs::SysRng))?;
+                self.commit(next, "Name participant")?;
                 self.wallet_event(events)?;
             }
             Command::Preview(path, format, password, keyfile) => {
@@ -276,7 +417,7 @@ impl Worker {
                 let document: Document = match format.as_str() {
                     "Bitwarden" => {
                         let c = kagitaba_cxf::bitwarden::from_json(&bytes)?;
-                        warnings = format!("\nConversion: {:?}", c.report());
+                        warnings = conversion_summary(c.report());
                         c.into_document()
                     }
                     "KeePass" => {
@@ -289,7 +430,7 @@ impl Worker {
                             password.as_deref().map(String::as_str),
                             key.as_deref().map(|v| v.as_slice()),
                         )?;
-                        warnings = format!("\nConversion: {:?}", c.report());
+                        warnings = conversion_summary(c.report());
                         c.into_document()
                     }
                     _ => Document::from_json(&bytes)?,
@@ -303,7 +444,12 @@ impl Worker {
                         .wallet,
                     &mut rand::rngs::SysRng,
                 )?;
-                events.send(Event::Preview(format!("{:?}{warnings}", plan.report())))?;
+                let report = plan.report();
+                events.send(Event::Preview(format!(
+                    "{} entries · {} collections · {} accounts\n{} empty accounts (no entries created)\n{} unresolved links · {} unsupported credentials · {} external files (attachment bytes are not imported){}",
+                    report.items, report.root_collections, report.accounts, report.empty_accounts,
+                    report.unresolved_links, report.opaque_credentials, report.external_files, warnings
+                )))?;
                 self.pending = Some(plan);
             }
             Command::Import(ids) => {
@@ -338,6 +484,8 @@ impl Worker {
             }
             Command::Titles => {
                 let s = self.session.as_ref().ok_or("Unlock a key first")?;
+                let snapshot = &self.store.as_ref().ok_or("Open a wallet first")?.snapshot;
+                events.send(Event::ParticipantNames(block_on(snapshot.participant_names(&s.encryption, s))?))?;
                 let mut titles = Vec::new();
                 for (id, e) in self
                     .store
@@ -347,6 +495,7 @@ impl Worker {
                     .wallet
                     .entries()
                 {
+                    if snapshot.is_metadata(id) { continue; }
                     if !e.grants().contains_key(&s.encryption.id()) {
                         continue;
                     }
@@ -446,9 +595,11 @@ impl Worker {
         }
         Ok(())
     }
-    fn commit(&mut self, next: Snapshot, message: &str) -> Result<()> {
+    fn commit(&mut self, mut next: Snapshot, message: &str) -> Result<()> {
         let s = self.session.as_ref().ok_or("Unlock a key first")?;
         let store = self.store.as_mut().ok_or("Open a wallet first")?;
+        next.prune_legacy(&mut rand::rngs::SysRng)?;
+        block_on(next.complete_metadata_grants(&s.encryption, s, &mut rand::rngs::SysRng))?;
         store.save(next, &Hardware(s), message)?;
         save_trust(store)?;
         Ok(())
@@ -457,13 +608,100 @@ impl Worker {
         let s = self.store.as_ref().ok_or("No wallet")?;
         events.send(Event::Wallet {
             path: s.path.clone(),
-            entries: s.snapshot.wallet.entries().keys().copied().collect(),
+            entries: s.snapshot.wallet.entries().keys().filter(|id| !s.snapshot.is_metadata(id)).copied().collect(),
             participants: s.snapshot.wallet.participants().keys().copied().collect(),
             head: s.head.to_string(),
         })?;
+        events.send(Event::DeviceHints(s.snapshot.devices.clone()))?;
+        if let Some(session) = &self.session {
+            let event = match block_on(s.snapshot.participant_names(&session.encryption, session)) {
+                Ok(names) => Event::ParticipantNames(names),
+                Err(_) => Event::ParticipantNamesUnavailable,
+            };
+            events.send(event)?;
+        }
         Ok(())
     }
 }
+fn merge_metadata(store: &mut Store, candidate: kagitaba_store::ObjectId, session: &Session<Usb>) -> Result<()> {
+    store.merge_then(candidate, &Hardware(session), |next| {
+        let legacy = !next.names.is_empty() || !next.browsers.is_empty();
+        next.prune_legacy(&mut rand::rngs::SysRng)?;
+        Ok(block_on(next.complete_metadata_grants(&session.encryption, session, &mut rand::rngs::SysRng))? || legacy)
+    })?;
+    Ok(())
+}
+fn conversion_summary(report: &kagitaba_cxf::ConversionReport) -> String {
+    use kagitaba_cxf::WarningKind;
+    let mut counts = BTreeMap::new();
+    for warning in &report.warnings {
+        let label = match warning.kind {
+            WarningKind::OpaqueItem => "Unsupported items retained as source data",
+            WarningKind::OpaqueOtp => "Unsupported one-time codes retained as source data",
+            WarningKind::OpaquePasskey => "Unsupported passkeys retained as source data",
+            WarningKind::OpaqueField => "Unsupported fields retained as source data",
+            WarningKind::UriPolicy => "URL matching rules retained but inactive",
+            WarningKind::MissingCollection => "Missing source collections",
+            WarningKind::Reprompt => "Additional authentication prompts not implemented",
+            WarningKind::Attachments => "Attachments not imported",
+            WarningKind::History => "Old credential history retained in encrypted source data",
+            WarningKind::Timestamp => "Unmapped source timestamps",
+            WarningKind::Deleted => "Trash entries excluded",
+            WarningKind::FieldReferences => {
+                "Field references retained literally; review before use"
+            }
+        };
+        *counts.entry(label).or_insert(0usize) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(label, count)| format!("\n{label}: {count}"))
+        .collect()
+}
+
+fn device_hint(card: &mut Piv<Usb>, slots: Slots) -> Result<Option<DeviceHint>> {
+    let serial = card.serial_number()?.to_string();
+    let hint = DeviceHint {
+        serial,
+        encryption_slot: slots.encryption(),
+        signing_slot: slots.signing(),
+    };
+    hint.validate()?;
+    Ok(Some(hint))
+}
+
+fn verify_device_hint(
+    snapshot: &Snapshot,
+    hint: &DeviceHint,
+    encryption: &PublicKey,
+    signing: &PublicKey,
+) -> Result<()> {
+    for (id, recorded) in &snapshot.devices {
+        if recorded == hint && (*id != encryption.id() || snapshot.signers.get(id) != Some(signing))
+        {
+            return Err("Device keys do not match the wallet's recorded participant".into());
+        }
+    }
+    Ok(())
+}
+
+fn remember_device(
+    snapshot: &mut Snapshot,
+    hint: DeviceHint,
+    encryption: &PublicKey,
+    signing: &PublicKey,
+) -> Result<()> {
+    if snapshot.wallet.participants().get(&encryption.id()) != Some(encryption)
+        || snapshot.signers.get(&encryption.id()) != Some(signing)
+    {
+        return Err("Enroll this key's public participant before remembering its slots".into());
+    }
+    hint.validate()?;
+    verify_device_hint(snapshot, &hint, encryption, signing)?;
+    snapshot.devices.insert(encryption.id(), hint);
+    Ok(())
+}
+
 fn read_limited(path: &Path, limit: u64) -> Result<Zeroizing<Vec<u8>>> {
     use std::io::Read;
     let mut bytes = Zeroizing::new(Vec::new());
@@ -526,4 +764,30 @@ fn save_trust(store: &Store) -> Result<()> {
     fs::rename(temp, &path)?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+    use kagitaba_core::crypto::SoftwareIdentity;
+
+    #[test]
+    fn serial_and_slots_never_replace_public_key_identity() {
+        let enc = SoftwareIdentity::from_bytes(&[1; 32]).unwrap().public_key();
+        let sign = SoftwareIdentity::from_bytes(&[2; 32]).unwrap().public_key();
+        let wrong = SoftwareIdentity::from_bytes(&[3; 32]).unwrap().public_key();
+        let hint = DeviceHint {
+            serial: "123456".into(),
+            encryption_slot: 0x94,
+            signing_slot: 0x95,
+        };
+        let mut snapshot = Snapshot::empty(enc.clone(), sign.clone()).unwrap();
+        assert!(remember_device(&mut snapshot, hint.clone(), &wrong, &sign).is_err());
+        assert!(remember_device(&mut snapshot, hint.clone(), &enc, &wrong).is_err());
+        assert!(snapshot.devices.is_empty());
+        remember_device(&mut snapshot, hint.clone(), &enc, &sign).unwrap();
+        assert!(verify_device_hint(&snapshot, &hint, &enc, &sign).is_ok());
+        assert!(verify_device_hint(&snapshot, &hint, &wrong, &sign).is_err());
+        assert!(verify_device_hint(&snapshot, &hint, &enc, &wrong).is_err());
+    }
 }

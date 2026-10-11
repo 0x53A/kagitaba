@@ -1,0 +1,29 @@
+[package]
+name = "kagitaba-android"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64 = "0.23.1"
+futures = "0.3.34"
+jni = "0.21.1"
+kagitaba-browser = { version = "0.1.0", path = "../kagitaba-browser" }
+kagitaba-core = { version = "0.1.0", path = "../.." }
+kagitaba-cxf = { version = "0.1.0", path = "../kagitaba-cxf" }
+kagitaba-device = { version = "0.1.0", path = "../kagitaba-device", default-features = false }
+kagitaba-store = { version = "0.1.0", path = "../kagitaba-store" }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pem", "alloc"] }
+rand_core = "0.10"
+serde_json = "1.0.152"
+zeroize = "1.9.1"
+
+[dev-dependencies]
+rand_chacha = "0.10"
+rand_core = "0.10"
+sha2 = "0.11"
+tempfile = "3.27.0"
+

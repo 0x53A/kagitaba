@@ -1,5 +1,5 @@
 //! Direct USB CCID, scoped to the selected Yubico smart-card interface.
-use crate::{Error, Result, Transport};
+use crate::{Error, Piv, Result, Transport};
 use nusb::{
     MaybeFuture,
     transfer::{Buffer, Bulk, In, Out},
@@ -11,6 +11,7 @@ pub struct Device {
     pub info: nusb::DeviceInfo,
     pub interface: u8,
     pub label: String,
+    pub serial: Option<String>,
 }
 pub fn devices() -> Result<Vec<Device>> {
     let mut out = Vec::new();
@@ -20,15 +21,28 @@ pub fn devices() -> Result<Vec<Device>> {
         }
         for intf in info.interfaces() {
             if intf.class() == 0x0b {
-                out.push(Device {
-                    label: format!(
-                        "{} — {}",
-                        info.product_string().unwrap_or("YubiKey"),
-                        info.serial_number().unwrap_or("no serial")
-                    ),
+                let mut device = Device {
+                    label: String::new(),
+                    serial: None,
                     interface: intf.interface_number(),
                     info: info.clone(),
-                });
+                };
+                // YubiKeys commonly omit the USB serial descriptor. Read the
+                // canonical decimal serial through PIV instead; never send a PIN.
+                device.serial = Usb::open(&device)
+                    .and_then(Piv::new)
+                    .and_then(|mut card| card.serial_number())
+                    .ok()
+                    .map(|serial| serial.to_string());
+                device.label = format!(
+                    "{} — {}",
+                    info.product_string().unwrap_or("YubiKey"),
+                    device
+                        .serial
+                        .as_deref()
+                        .unwrap_or("serial unavailable (USB busy or inaccessible)")
+                );
+                out.push(device);
             }
         }
     }

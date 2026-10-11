@@ -5,13 +5,17 @@ edition = "2024"
 publish = false
 
 [dependencies]
-gix = { version = "0.89.0", default-features = false, features = ["sha1"] }
+base64 = "0.22.1"
+gix = { version = "0.89.0", default-features = false, features = ["index", "sha1"] }
 hex = "0.4.3"
 kagitaba-core = { version = "0.1.0", path = "../.." }
+kagitaba-cxf = { version = "0.1.0", path = "../kagitaba-cxf" }
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pem"] }
+rand_core = "0.10"
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 ssh-key = { version = "0.6.7", features = ["ecdsa", "p256"] }
+tempfile = "3.27.0"
 thiserror = "2.0.21"
 zeroize = "1.9.1"
 
@@ -19,4 +23,3 @@ zeroize = "1.9.1"
 futures = "0.3.34"
 kagitaba-cxf = { path = "../kagitaba-cxf" }
 rand_chacha = "0.10.0"
-tempfile = "3.27.0"

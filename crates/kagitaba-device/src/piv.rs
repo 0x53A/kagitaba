@@ -9,6 +9,39 @@ use std::sync::Mutex;
 use zeroize::Zeroizing;
 pub const ENCRYPTION_SLOT: u8 = 0x82;
 pub const SIGNING_SLOT: u8 = 0x83;
+/// Application keys use two distinct retired key-management slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slots {
+    encryption: u8,
+    signing: u8,
+}
+impl Slots {
+    pub fn new(encryption: u8, signing: u8) -> Result<Self> {
+        check_slot(encryption)?;
+        check_slot(signing)?;
+        if encryption == signing {
+            return Err(Error::InvalidSlots);
+        }
+        Ok(Self {
+            encryption,
+            signing,
+        })
+    }
+    pub fn encryption(self) -> u8 {
+        self.encryption
+    }
+    pub fn signing(self) -> u8 {
+        self.signing
+    }
+}
+impl Default for Slots {
+    fn default() -> Self {
+        Self {
+            encryption: ENCRYPTION_SLOT,
+            signing: SIGNING_SLOT,
+        }
+    }
+}
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("USB unavailable, busy, or permission denied")]
@@ -27,6 +60,8 @@ pub enum Error {
     Unsupported,
     #[error("slot already contains a key; nothing overwritten")]
     Occupied,
+    #[error("choose two distinct PIV slots from 82–95 (hex)")]
+    InvalidSlots,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 /// APDU exchanges must be exclusive for the session's lifetime.
@@ -78,6 +113,13 @@ impl<T: Transport> Piv<T> {
     pub fn verify_pin(&mut self, pin: &str) -> Result<()> {
         self.command(0x20, 0, 0x80, &*pin_bytes(pin)?)?;
         Ok(())
+    }
+    /// Read the public device serial without PIN or management authentication.
+    pub fn serial_number(&mut self) -> Result<u32> {
+        let bytes = self.command(0xf8, 0, 0, &[])?;
+        Ok(u32::from_be_bytes(
+            bytes.as_slice().try_into().map_err(|_| Error::Protocol)?,
+        ))
     }
     pub fn change_pin(&mut self, old: &str, new: &str) -> Result<()> {
         let mut data = Zeroizing::new(Vec::from(&*pin_bytes(old)?));
@@ -187,16 +229,21 @@ impl<T: Transport> Piv<T> {
 }
 pub struct Session<T: Transport> {
     card: Mutex<Piv<T>>,
+    slots: Slots,
     pub encryption: PublicKey,
     pub signing: PublicKey,
 }
 impl<T: Transport> Session<T> {
-    pub fn unlock(mut card: Piv<T>, pin: &str) -> Result<Self> {
-        let encryption = card.public_key(ENCRYPTION_SLOT)?;
-        let signing = card.public_key(SIGNING_SLOT)?;
+    pub fn unlock(card: Piv<T>, pin: &str) -> Result<Self> {
+        Self::unlock_with_slots(card, pin, Slots::default())
+    }
+    pub fn unlock_with_slots(mut card: Piv<T>, pin: &str, slots: Slots) -> Result<Self> {
+        let encryption = card.public_key(slots.encryption)?;
+        let signing = card.public_key(slots.signing)?;
         card.verify_pin(pin)?;
         Ok(Self {
             card: Mutex::new(card),
+            slots,
             encryption,
             signing,
         })
@@ -205,7 +252,7 @@ impl<T: Transport> Session<T> {
         self.card
             .lock()
             .map_err(|_| Error::Usb)?
-            .sign(SIGNING_SLOT, message)
+            .sign(self.slots.signing, message)
     }
 }
 impl<T: Transport> KeyAgreement for Session<T> {
@@ -219,15 +266,15 @@ impl<T: Transport> KeyAgreement for Session<T> {
         self.card
             .lock()
             .map_err(|_| kagitaba_core::Error::KeyUnavailable)?
-            .agree(ENCRYPTION_SLOT, request.peer_public_key())
+            .agree(self.slots.encryption, request.peer_public_key())
             .map_err(|_| kagitaba_core::Error::KeyUnavailable)
     }
 }
 fn check_slot(slot: u8) -> Result<()> {
-    if matches!(slot, ENCRYPTION_SLOT | SIGNING_SLOT) {
+    if (0x82..=0x95).contains(&slot) {
         Ok(())
     } else {
-        Err(Error::Unsupported)
+        Err(Error::InvalidSlots)
     }
 }
 fn pin_bytes(pin: &str) -> Result<Zeroizing<[u8; 8]>> {
