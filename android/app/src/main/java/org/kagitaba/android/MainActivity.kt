@@ -147,6 +147,12 @@ class MainActivity : SecureActivity() {
     }
     private fun settings() {
         screen("Settings") { home() }
+        if (vault.unlocked) {
+            val info = vault.device.publicInfo()
+            label("Current YubiKey policies (read-only)")
+            label(policyDescription("Encryption", info.optJSONObject("encryptionPolicy")))
+            label(policyDescription("Signing", info.optJSONObject("signingPolicy")))
+        }
         button("Repository connection") { screen("Repository connection") { settings() }; connectionForm(true) }
         button("Participant names") { participants() }
         button("Backups & updates") { backups() }

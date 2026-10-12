@@ -24,12 +24,30 @@ import org.json.JSONObject
 
 /** Transport only; the shared Rust adapter owns PIV, ECDH, and signatures. */
 interface PivTransport { fun exchange(command: ByteArray): ByteArray }
-class PivConnection(private val connection: SmartCardConnection) : java.io.Closeable, PivTransport {
+fun policyDescription(label: String, policy: JSONObject?): String {
+    if (policy == null) return "$label: policy unavailable from device"
+    val pin = when (policy.optInt("pin")) { 1 -> "Never"; 2 -> "Once"; 3 -> "Always (per-operation PIN prompts are not supported)"; else -> "Unknown (${policy.optInt("pin")})" }
+    val touch = when (policy.optInt("touch")) { 1 -> "Never"; 2 -> "Always"; 3 -> "Cached"; else -> "Unknown (${policy.optInt("touch")})" }
+    return "$label: PIN $pin · touch $touch"
+}
+@androidx.annotation.Keep
+class PivConnection(private val connection: SmartCardConnection, private val progress: (PivConnection, Int) -> Unit = { _, _ -> }) : java.io.Closeable, PivTransport {
+    // Called by JNI only around an actual private command, never a PIN attempt.
+    @Suppress("unused") fun setTouchPending(policy: Int) { progress(this, policy) }
     @Synchronized override fun exchange(command: ByteArray): ByteArray = connection.sendAndReceive(command)
     @Synchronized override fun close() { connection.close() }
 }
 
 class PivIdentity(private val context: Context) {
+    val touchListeners = java.util.concurrent.CopyOnWriteArraySet<() -> Unit>()
+    @Volatile var touchPolicy: Int = -1; private set
+    private fun touchProgress(source: PivConnection, policy: Int) {
+        synchronized(this) {
+            if (connection !== source) return
+            touchPolicy = policy
+        }
+        touchListeners.forEach { it() }
+    }
     @Volatile private var info: JSONObject? = null
     private var connection: PivConnection? = null
     private var manager: YubiKitManager? = null
@@ -44,7 +62,8 @@ class PivIdentity(private val context: Context) {
     }
     fun close() {
         val old = handle; handle = null; info = null
-        val oldConnection = connection; connection = null
+        val oldConnection = synchronized(this) { val oldCard = connection; connection = null; touchPolicy = -1; oldCard }
+        touchListeners.forEach { it() }
         val oldManager = manager
         nfcActivity?.get()?.let { activity -> activity.runOnUiThread { runCatching { oldManager?.stopNfcDiscovery(activity) } } }
         nfcActivity = null; manager = null
@@ -63,7 +82,7 @@ class PivIdentity(private val context: Context) {
             else "Choose an existing P-256 slot pair after connecting your YubiKey.")
         val status = label("Plug in the key or hold it against the NFC reader, then press Detect YubiKey.")
         val options = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE; layout.addView(this) }
-        fun optionLabel(text: String) { options.addView(TextView(activity).apply { this.text = text; setTextColor(WalletTheme.muted); setPadding(0, WalletTheme.dp(activity, 12), 0, WalletTheme.dp(activity, 8)) }) }
+        fun optionLabel(text: String) { options.addView(TextView(activity).apply { this.text = text; if (text == "YubiKey PIV PIN") setTypeface(typeface, android.graphics.Typeface.BOLD); setTextColor(WalletTheme.muted); setPadding(0, WalletTheme.dp(activity, 12), 0, WalletTheme.dp(activity, 8)) }) }
         fun field(title: String): EditText {
             optionLabel(title)
             return EditText(activity).also { it.isSingleLine = true; it.isSaveEnabled = false
@@ -74,13 +93,36 @@ class PivIdentity(private val context: Context) {
         val participants = if (candidates != null) chooser("Wallet participant") else null
         val encSlots = if (candidates == null) chooser("Encryption slot") else null
         val sigSlots = if (candidates == null) chooser("Signing slot") else null
+        fun policyPicker(title: String, values: List<String>, selected: Int): Spinner = chooser(title).apply {
+            adapter = ArrayAdapter(activity, android.R.layout.simple_spinner_dropdown_item, values); setSelection(selected)
+        }
+        val encPin = if (provision) policyPicker("Encryption PIN policy", listOf("Once per session (default)", "Never — no hardware PIN requirement"), 0) else null
+        val encTouch = if (provision) policyPicker("Encryption touch policy", listOf("Never", "Always", "Cached (default)"), 2) else null
+        val sigPin = if (provision) policyPicker("Signing PIN policy", listOf("Once per session (default)", "Never — no hardware PIN requirement"), 0) else null
+        val sigTouch = if (provision) policyPicker("Signing touch policy", listOf("Never", "Always (default)", "Cached"), 1) else null
+        if (provision) optionLabel("Policies are fixed at key creation. Cached touch lasts briefly. PIN Always needs per-operation PIN prompts, which are not supported. Kagitaba still asks for a PIV PIN when PIN Never is selected.")
+        val currentPolicies = TextView(activity).also { it.setTextColor(WalletTheme.ink); options.addView(it) }
+        var slotPolicies = JSONObject()
+        var matches = emptyList<JSONObject>()
+        var slots = emptyList<Int>()
+        fun showPolicies() {
+            if (provision) return
+            val selected = if (candidates != null) matches.getOrNull(participants!!.selectedItemPosition) else null
+            val encryption = selected?.optJSONObject("encryptionPolicy") ?: slots.getOrNull(encSlots?.selectedItemPosition ?: -1)?.let { slotPolicies.optJSONObject(it.toString()) }
+            val signing = selected?.optJSONObject("signingPolicy") ?: slots.getOrNull(sigSlots?.selectedItemPosition ?: -1)?.let { slotPolicies.optJSONObject(it.toString()) }
+            currentPolicies.text = "Current device policies (read-only)\n" + policyDescription("Encryption", encryption) + "\n" + policyDescription("Signing", signing)
+        }
         val pin = field("YubiKey PIV PIN")
         val management = if (provision) field("Management key (hex)") else null
         if (provision) options.addView(Button(activity).apply { text = "Use factory management key"; isAllCaps = false
             setOnClickListener { management!!.setText("010203040506070801020304050607080102030405060708") } })
         val consent = if (provision) CheckBox(activity).also { it.text = "Generate keys in the two selected empty slots. This changes the YubiKey; existing keys will not be overwritten."; options.addView(it) } else null
-        var matches = emptyList<JSONObject>()
-        var slots = emptyList<Int>()
+        for (spinner in listOfNotNull(participants, encSlots, sigSlots, encPin, encTouch, sigPin, sigTouch)) {
+            spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { consent?.isChecked = false; showPolicies() }
+                override fun onNothingSelected(parent: AdapterView<*>?) { showPolicies() }
+            }
+        }
         var serial = ""
         var finished = false
         var attempting = false
@@ -117,7 +159,7 @@ class PivIdentity(private val context: Context) {
                 var opened: PivConnection? = null
                 try {
                     val result = withContext(Dispatchers.IO) {
-                        opened = PivConnection(device.openConnection(SmartCardConnection::class.java))
+                        opened = PivConnection(device.openConnection(SmartCardConnection::class.java), ::touchProgress)
                         bridge(if (candidates != null) json("op" to "inspect", "candidates" to candidates) else json("op" to "inspect_slots"), opened!!)
                     }
                     if (!dialog.isShowing || finished) error("Authentication expired")
@@ -128,6 +170,7 @@ class PivIdentity(private val context: Context) {
                             "${it.optString("name").ifEmpty { it.getString("participantId").take(16) }} · ${it.getInt("encryptionSlot").toString(16)} / ${it.getInt("signingSlot").toString(16)}"
                         })
                     } else {
+                        slotPolicies = result.optJSONObject("policies") ?: JSONObject()
                         serial = result.getString("serial")
                         val values = result.getJSONArray(if (provision) "emptySlots" else "occupiedSlots")
                         slots = (0 until values.length()).map { values.getInt(it) }
@@ -136,6 +179,7 @@ class PivIdentity(private val context: Context) {
                         sigSlots.setSelection(1)
                     }
                     pending = opened; opened = null; detectedDevice = device
+                    showPolicies()
                     attempting = false; options.visibility = View.VISIBLE
                     status.text = if (candidates != null) "Matched ${matches.size} participant(s). Keep the key connected and enter its PIV PIN." else "YubiKey $serial. Select the slot pair and enter its PIV PIN."
                     dialog.getButton(AlertDialog.BUTTON_POSITIVE).apply { text = if (provision) "Generate keys" else "Unlock"; isEnabled = true }
@@ -174,6 +218,8 @@ class PivIdentity(private val context: Context) {
             if (provision) {
                 if (consent?.isChecked != true) { status.text = "Confirm generation in the selected empty PIV slots."; return@setOnClickListener }
                 request.put("op", "provision").put("confirmed", true).put("managementKey", management!!.text.toString().trim())
+                request.put("encryptionPolicy", json("pin" to if (encPin!!.selectedItemPosition == 0) 2 else 1, "touch" to encTouch!!.selectedItemPosition + 1))
+                request.put("signingPolicy", json("pin" to if (sigPin!!.selectedItemPosition == 0) 2 else 1, "touch" to sigTouch!!.selectedItemPosition + 1))
             }
             request.put("pin", enteredPin); pin.text.clear(); management?.text?.clear()
             attempting = true; dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
@@ -183,7 +229,8 @@ class PivIdentity(private val context: Context) {
                 try {
                     withContext(Dispatchers.IO) { result = bridge(request, card) }
                     if (!dialog.isShowing || finished) error("Authentication expired")
-                    connection = card; pending = null; info = result!!; handle = result!!.getString("identity")
+                    synchronized(this@PivIdentity) { connection = card; touchPolicy = -1 }
+                    pending = null; info = result!!; handle = result!!.getString("identity")
                     manager = discovery; nfcActivity = java.lang.ref.WeakReference(activity)
                     val openedHandle = handle
                     (detectedDevice as? UsbYubiKeyDevice)?.setOnClosed { activity.runOnUiThread { if (handle == openedHandle) owner.lock() } }
@@ -201,6 +248,7 @@ class PivIdentity(private val context: Context) {
 object PivErrors {
     private val messages = setOf(
         "PIV operation failed. Reconnect your YubiKey and unlock again.",
+        "Unsupported PIV policy selection.",
         "PIV PIN is blocked. Use your recovery procedure on your computer.",
         "Incorrect PIV PIN. 1 attempt remains. No automatic retry.",
         "Incorrect PIV PIN. 2 attempts remain. No automatic retry.",

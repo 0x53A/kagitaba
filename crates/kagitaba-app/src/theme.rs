@@ -8,6 +8,16 @@ pub const LINE: Color32 = Color32::from_rgb(52, 82, 92);
 pub const ERROR: Color32 = Color32::from_rgb(245, 182, 212);
 
 pub fn install(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "DejaVu Sans Bold".into(),
+        egui::FontData::from_static(include_bytes!("../assets/DejaVuSans-Bold.ttf")).into(),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("bold".into()),
+        vec!["DejaVu Sans Bold".into()],
+    );
+    ctx.set_fonts(fonts);
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     style.visuals = egui::Visuals::dark();
     style.visuals.override_text_color = Some(INK);

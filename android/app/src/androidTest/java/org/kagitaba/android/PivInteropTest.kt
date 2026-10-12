@@ -24,6 +24,9 @@ class PivInteropTest {
     class Card(initialSlots: List<Int> = listOf(0x82, 0x83)) : PivTransport {
         private val generator = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }
         val keys = initialSlots.associateWith { generator.generateKeyPair() }.toMutableMap()
+        val policies = initialSlots.associateWith { byteArrayOf(2, 3) }.toMutableMap()
+        val touchEvents = mutableListOf<Int>()
+        @Suppress("unused") fun setTouchPending(policy: Int) { touchEvents.add(policy) }
         var generations = 0
         var managementAuthenticated = false
         var verifies = 0
@@ -41,7 +44,7 @@ class PivInteropTest {
                 0xf7 -> {
                     if (slot == 0x9b) return byteArrayOf(1, 1, 3, 0x90.toByte(), 0)
                     val pair = keys[slot] ?: return byteArrayOf(0x6a, 0x88.toByte())
-                    byteArrayOf(1, 1, 0x11, 4, 67, 0x86.toByte(), 65) + point(pair.public as ECPublicKey)
+                    byteArrayOf(2, 2) + policies.getValue(slot) + byteArrayOf(1, 1, 0x11, 4, 67, 0x86.toByte(), 65) + point(pair.public as ECPublicKey)
                 }
                 0x20 -> {
                     verifies++
@@ -71,6 +74,7 @@ class PivInteropTest {
                 0x47 -> {
                     check(verified && managementAuthenticated && slot !in keys)
                     val key = generator.generateKeyPair(); keys[slot] = key; generations++
+                    policies[slot] = byteArrayOf(command[12], command[15])
                     byteArrayOf(0x7f, 0x49, 67, 0x86.toByte(), 65) + point(key.public as ECPublicKey)
                 }
                 else -> error("Unexpected APDU")
@@ -110,6 +114,8 @@ class PivInteropTest {
             assertEquals("synthetic-token", NativeBridge.call("local_decrypt", json("identity" to identity, "context" to "synthetic-git-url-user", "envelope" to wrapped.getString("envelope"))).getString("plaintext"))
             assertThrows(IllegalStateException::class.java) { NativeBridge.call("local_decrypt", json("identity" to identity, "context" to "different-user", "envelope" to wrapped.getString("envelope"))) }
             assertEquals(1, card.verifies)
+            assertTrue(card.touchEvents.isNotEmpty())
+            assertTrue(card.touchEvents.chunked(2).all { it == listOf(3, -1) })
         } finally { NativeBridge.call("piv_close", json("identity" to identity)); path.deleteRecursively() }
         assertThrows(IllegalStateException::class.java) { NativeBridge.call("local_encrypt", json("identity" to identity, "context" to "closed", "plaintext" to "synthetic")) }
     }
@@ -142,8 +148,13 @@ class PivInteropTest {
         request.put("signingSlot", 0x85).put("confirmed", false)
         assertThrows(IllegalStateException::class.java) { command(card, request) }
         assertEquals(0, card.generations)
+        request.put("encryptionPolicy", json("pin" to 1, "touch" to 1)).put("signingPolicy", json("pin" to 2, "touch" to 3))
         val result = command(card, request.put("confirmed", true))
         assertEquals(2, card.generations)
+        assertArrayEquals(byteArrayOf(1, 1), card.policies.getValue(0x84))
+        assertArrayEquals(byteArrayOf(2, 3), card.policies.getValue(0x85))
+        assertEquals(1, result.getJSONObject("encryptionPolicy").getInt("pin"))
+        assertEquals(3, result.getJSONObject("signingPolicy").getInt("touch"))
         assertArrayEquals(old, card.keys.getValue(0x82).public.encoded)
         NativeBridge.call("piv_close", json("identity" to result.getString("identity")))
     }

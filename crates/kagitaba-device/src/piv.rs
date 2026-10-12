@@ -9,6 +9,90 @@ use std::sync::Mutex;
 use zeroize::Zeroizing;
 pub const ENCRYPTION_SLOT: u8 = 0x82;
 pub const SIGNING_SLOT: u8 = 0x83;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinPolicy {
+    Never,
+    Once,
+    Always,
+    Unknown(u8),
+}
+impl PinPolicy {
+    pub fn from_byte(value: u8) -> Self {
+        match value {
+            1 => Self::Never,
+            2 => Self::Once,
+            3 => Self::Always,
+            other => Self::Unknown(other),
+        }
+    }
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Never => 1,
+            Self::Once => 2,
+            Self::Always => 3,
+            Self::Unknown(value) => value,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchPolicy {
+    Never,
+    Always,
+    Cached,
+    Unknown(u8),
+}
+impl TouchPolicy {
+    pub fn from_byte(value: u8) -> Self {
+        match value {
+            1 => Self::Never,
+            2 => Self::Always,
+            3 => Self::Cached,
+            other => Self::Unknown(other),
+        }
+    }
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Never => 1,
+            Self::Always => 2,
+            Self::Cached => 3,
+            Self::Unknown(value) => value,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyPolicy {
+    pub pin: PinPolicy,
+    pub touch: TouchPolicy,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Policies {
+    pub encryption: KeyPolicy,
+    pub signing: KeyPolicy,
+}
+impl Default for Policies {
+    fn default() -> Self {
+        Self {
+            encryption: KeyPolicy {
+                pin: PinPolicy::Once,
+                touch: TouchPolicy::Cached,
+            },
+            signing: KeyPolicy {
+                pin: PinPolicy::Once,
+                touch: TouchPolicy::Always,
+            },
+        }
+    }
+}
+pub struct KeyMetadata {
+    pub public_key: PublicKey,
+    pub policy: Option<KeyPolicy>,
+}
+/// A private command is in flight, not proof that the card is waiting for touch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateOperation {
+    Started(Option<TouchPolicy>),
+    Finished,
+}
 /// Application keys use two distinct retired key-management slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slots {
@@ -128,16 +212,51 @@ impl<T: Transport> Piv<T> {
         Ok(())
     }
     pub fn public_key(&mut self, slot: u8) -> Result<PublicKey> {
+        Ok(self.key_metadata(slot)?.public_key)
+    }
+    pub fn key_metadata(&mut self, slot: u8) -> Result<KeyMetadata> {
         check_slot(slot)?;
         let metadata = self.command(0xf7, 0, slot, &[])?;
         if tag(&metadata, 1)? != [0x11] {
             return Err(Error::Unsupported);
         }
-        point_key(tag(tag(&metadata, 4)?, 0x86)?)
+        let policy = optional_tag(&metadata, 2)?
+            .map(|bytes| {
+                let [pin, touch] = bytes else {
+                    return Err(Error::Protocol);
+                };
+                Ok(KeyPolicy {
+                    pin: PinPolicy::from_byte(*pin),
+                    touch: TouchPolicy::from_byte(*touch),
+                })
+            })
+            .transpose()?;
+        Ok(KeyMetadata {
+            public_key: point_key(tag(tag(&metadata, 4)?, 0x86)?)?,
+            policy,
+        })
     }
     /// Requires explicit user authorization and management authentication.
     /// Never overwrites any slot that cannot be proven empty via metadata.
     pub fn generate_empty(&mut self, slot: u8, touch_cached: bool) -> Result<PublicKey> {
+        self.generate_empty_with_policy(
+            slot,
+            KeyPolicy {
+                pin: PinPolicy::Once,
+                touch: if touch_cached {
+                    TouchPolicy::Cached
+                } else {
+                    TouchPolicy::Always
+                },
+            },
+        )
+    }
+    pub fn generate_empty_with_policy(&mut self, slot: u8, policy: KeyPolicy) -> Result<PublicKey> {
+        if matches!(policy.pin, PinPolicy::Unknown(_))
+            || matches!(policy.touch, TouchPolicy::Unknown(_))
+        {
+            return Err(Error::Unsupported);
+        }
         check_slot(slot)?;
         match self.command(0xf7, 0, slot, &[]) {
             Err(Error::Status(0x6a88)) => {}
@@ -156,10 +275,10 @@ impl<T: Transport> Piv<T> {
                 0x11,
                 0xaa,
                 1,
-                2,
+                policy.pin.code(),
                 0xab,
                 1,
-                if touch_cached { 3 } else { 2 },
+                policy.touch.code(),
             ],
         )?;
         point_key(tag(tag(&response, 0x7f49)?, 0x86)?)
@@ -232,27 +351,44 @@ pub struct Session<T: Transport> {
     slots: Slots,
     pub encryption: PublicKey,
     pub signing: PublicKey,
+    pub encryption_policy: Option<KeyPolicy>,
+    pub signing_policy: Option<KeyPolicy>,
+    observer: Option<Box<dyn Fn(PrivateOperation) + Send + Sync>>,
 }
 impl<T: Transport> Session<T> {
     pub fn unlock(card: Piv<T>, pin: &str) -> Result<Self> {
         Self::unlock_with_slots(card, pin, Slots::default())
     }
     pub fn unlock_with_slots(mut card: Piv<T>, pin: &str, slots: Slots) -> Result<Self> {
-        let encryption = card.public_key(slots.encryption)?;
-        let signing = card.public_key(slots.signing)?;
+        let encryption = card.key_metadata(slots.encryption)?;
+        let signing = card.key_metadata(slots.signing)?;
         card.verify_pin(pin)?;
         Ok(Self {
             card: Mutex::new(card),
             slots,
-            encryption,
-            signing,
+            encryption: encryption.public_key,
+            signing: signing.public_key,
+            encryption_policy: encryption.policy,
+            signing_policy: signing.policy,
+            observer: None,
         })
     }
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
-        self.card
-            .lock()
-            .map_err(|_| Error::Usb)?
-            .sign(self.slots.signing, message)
+        let mut card = self.card.lock().map_err(|_| Error::Usb)?;
+        self.notify(PrivateOperation::Started(
+            self.signing_policy.map(|p| p.touch),
+        ));
+        let result = card.sign(self.slots.signing, message);
+        self.notify(PrivateOperation::Finished);
+        result
+    }
+    pub fn set_observer(&mut self, observer: impl Fn(PrivateOperation) + Send + Sync + 'static) {
+        self.observer = Some(Box::new(observer));
+    }
+    fn notify(&self, event: PrivateOperation) {
+        if let Some(observer) = &self.observer {
+            observer(event);
+        }
     }
 }
 impl<T: Transport> KeyAgreement for Session<T> {
@@ -263,11 +399,16 @@ impl<T: Transport> KeyAgreement for Session<T> {
         if request.recipient() != self.key_id() {
             return Err(kagitaba_core::Error::WrongRecipient);
         }
-        self.card
+        let mut card = self
+            .card
             .lock()
-            .map_err(|_| kagitaba_core::Error::KeyUnavailable)?
-            .agree(self.slots.encryption, request.peer_public_key())
-            .map_err(|_| kagitaba_core::Error::KeyUnavailable)
+            .map_err(|_| kagitaba_core::Error::KeyUnavailable)?;
+        self.notify(PrivateOperation::Started(
+            self.encryption_policy.map(|p| p.touch),
+        ));
+        let result = card.agree(self.slots.encryption, request.peer_public_key());
+        self.notify(PrivateOperation::Finished);
+        result.map_err(|_| kagitaba_core::Error::KeyUnavailable)
     }
 }
 fn check_slot(slot: u8) -> Result<()> {
@@ -294,7 +435,10 @@ fn point_key(point: &[u8]) -> Result<PublicKey> {
     )
     .map_err(|_| Error::Protocol)
 }
-fn tag(mut bytes: &[u8], wanted: u16) -> Result<&[u8]> {
+fn tag(bytes: &[u8], wanted: u16) -> Result<&[u8]> {
+    optional_tag(bytes, wanted)?.ok_or(Error::Protocol)
+}
+fn optional_tag(mut bytes: &[u8], wanted: u16) -> Result<Option<&[u8]>> {
     let mut found = None;
     while !bytes.is_empty() {
         let mut t = bytes[0] as u16;
@@ -334,5 +478,5 @@ fn tag(mut bytes: &[u8], wanted: u16) -> Result<&[u8]> {
             found = Some(value);
         }
     }
-    found.ok_or(Error::Protocol)
+    Ok(found)
 }

@@ -131,17 +131,72 @@ fn generation_sets_pin_and_touch_policy_explicitly() {
     let mut response = vec![0x7f, 0x49, 67, 0x86, 65];
     response.extend_from_slice(point.as_bytes());
     response.extend([0x90, 0]);
-    for (slot, touch) in [(0x82, 3), (0x83, 2), (0x84, 3), (0x95, 2)] {
+    for (slot, pin, touch) in [
+        (0x82, 2, 3),
+        (0x83, 2, 2),
+        (0x84, 1, 1),
+        (0x95, 1, 2),
+        (0x85, 2, 1),
+        (0x86, 1, 3),
+    ] {
         let mut card = script(vec![
             (vec![0, 0xf7, 0, slot], vec![0x6a, 0x88]),
             (
                 vec![
-                    0, 0x47, 0, slot, 11, 0xac, 9, 0x80, 1, 0x11, 0xaa, 1, 2, 0xab, 1, touch,
+                    0, 0x47, 0, slot, 11, 0xac, 9, 0x80, 1, 0x11, 0xaa, 1, pin, 0xab, 1, touch,
                 ],
                 response.clone(),
             ),
         ]);
-        assert!(card.generate_empty(slot, touch == 3).is_ok());
+        assert!(
+            card.generate_empty_with_policy(
+                slot,
+                KeyPolicy {
+                    pin: PinPolicy::from_byte(pin),
+                    touch: TouchPolicy::from_byte(touch)
+                }
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[test]
+fn metadata_preserves_unknown_policies_and_rejects_malformed_policy_fields() {
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    let point = p256::SecretKey::from_slice(&[7; 32])
+        .unwrap()
+        .public_key()
+        .to_sec1_point(false);
+    for (field, expected) in [
+        (vec![], Ok(None)),
+        (
+            vec![2, 2, 2, 3],
+            Ok(Some(KeyPolicy {
+                pin: PinPolicy::Once,
+                touch: TouchPolicy::Cached,
+            })),
+        ),
+        (
+            vec![2, 2, 4, 99],
+            Ok(Some(KeyPolicy {
+                pin: PinPolicy::Unknown(4),
+                touch: TouchPolicy::Unknown(99),
+            })),
+        ),
+        (vec![2, 1, 2], Err(())),
+        (vec![2, 3, 2, 3, 0], Err(())),
+        (vec![2, 2, 2, 3, 2, 2, 2, 3], Err(())),
+    ] {
+        let mut response = vec![1, 1, 0x11, 4, 67, 0x86, 65];
+        response.extend_from_slice(point.as_bytes());
+        response.extend(field);
+        response.extend([0x90, 0]);
+        let mut card = script(vec![(vec![0, 0xf7, 0, 0x82], response)]);
+        assert_eq!(
+            card.key_metadata(0x82).map(|m| m.policy).map_err(|_| ()),
+            expected
+        );
     }
 }
 
@@ -180,6 +235,7 @@ fn exercise_session(slots: Slots) {
         encryption: p256::SecretKey,
         signing: SigningKey,
         verified: bool,
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
     impl Transport for Card {
         fn exchange(&mut self, apdu: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
@@ -196,12 +252,31 @@ fn exercise_session(slots: Slots) {
                     } else {
                         self.signing.verifying_key().to_sec1_point(false)
                     };
-                    let mut v = vec![1, 1, 0x11, 4, 67, 0x86, 65];
+                    let mut v = vec![
+                        2,
+                        2,
+                        2,
+                        if apdu[3] == self.slots.encryption() {
+                            3
+                        } else {
+                            2
+                        },
+                        1,
+                        1,
+                        0x11,
+                        4,
+                        67,
+                        0x86,
+                        65,
+                    ];
                     v.extend_from_slice(point.as_bytes());
                     v
                 }
                 0x87 => {
                     assert!(self.verified);
+                    if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(Error::Usb);
+                    }
                     assert!([self.slots.encryption(), self.slots.signing()].contains(&apdu[3]));
                     let value = if apdu[3] == self.slots.encryption() {
                         assert_eq!(&apdu[5..11], &[0x7c, 69, 0x82, 0, 0x85, 65]);
@@ -229,13 +304,18 @@ fn exercise_session(slots: Slots) {
     }
     let signing = SigningKey::from_slice(&[6; 32]).unwrap();
     let verifier = *signing.verifying_key();
+    let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let card = Card {
         slots,
         encryption: p256::SecretKey::from_slice(&[8; 32]).unwrap(),
         signing,
         verified: false,
+        fail: fail.clone(),
     };
-    let session = Session::unlock_with_slots(Piv::new(card).unwrap(), "123456", slots).unwrap();
+    let mut session = Session::unlock_with_slots(Piv::new(card).unwrap(), "123456", slots).unwrap();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = events.clone();
+    session.set_observer(move |event| observed.lock().unwrap().push(event));
     let mut rng = ChaCha20Rng::from_seed([3; 32]);
     let key = ContentKey::generate(&mut rng).unwrap();
     let wrap = WrappedKey::wrap(&key, &session.encryption, b"fixture", &mut rng).unwrap();
@@ -254,4 +334,34 @@ fn exercise_session(slots: Slots) {
         .verify(b"signed wallet commit", &signature)
         .unwrap();
     assert!(verifier.verify(b"altered commit", &signature).is_err());
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            PrivateOperation::Started(Some(TouchPolicy::Cached)),
+            PrivateOperation::Finished,
+            PrivateOperation::Started(Some(TouchPolicy::Always)),
+            PrivateOperation::Finished
+        ]
+    );
+    events.lock().unwrap().clear();
+    fail.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(session.sign(b"failing operation").is_err());
+    assert!(
+        futures::executor::block_on(wrap.unwrap(&session.encryption, b"fixture", &session))
+            .is_err()
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            PrivateOperation::Started(Some(TouchPolicy::Always)),
+            PrivateOperation::Finished,
+            PrivateOperation::Started(Some(TouchPolicy::Cached)),
+            PrivateOperation::Finished
+        ]
+    );
+    events.lock().unwrap().clear();
+    assert!(
+        futures::executor::block_on(wrap.unwrap(&session.signing, b"fixture", &session)).is_err()
+    );
+    assert!(events.lock().unwrap().is_empty());
 }

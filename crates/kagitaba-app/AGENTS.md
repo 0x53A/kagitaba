@@ -80,7 +80,23 @@ public keys are read through PIV metadata. Existing PIN and management-key value
 are supplied by the user; global PIN/management key are not changed automatically.
 The factory-management-key button is explicit, not an automatic fallback.
 Management authentication supports TDES and AES-128/192/256 according to metadata.
-Encryption uses PIN-once/touch-cached; signing uses PIN-once/touch-always.
+New-slot setup defaults to PIN-once/touch-cached for encryption and
+PIN-once/touch-always for signing. Each slot offers PIN Once or Never and touch
+Never, Always or Cached. PIN Always is not offered: sessions discard the PIN and
+do not implement per-operation PIN prompts. Kagitaba still verifies the PIV PIN
+at unlock with a hardware PIN Never policy. Changing slot/policy selection clears
+generation consent. Policies cannot be edited on existing keys; key replacement
+is never implicit. Keys & access shows actual device-reported policies after
+unlock, including unavailable/unknown values and a PIN Always limitation.
+The PIV PIN label is bold. A persistent operation banner appears around hardware
+private commands (including within the narrow details modal) and management
+authentication. The native bold face is bundled DejaVu Sans Bold 2.37, unchanged
+from the Nix dejavu-fonts package, with upstream license in assets/DejaVu-LICENSE.txt
+(https://github.com/dejavu-fonts/dejavu-fonts/blob/version_2_37/LICENSE).
+Its embedded font metadata also retains the copyright and license notices.
+Always/Cached/Never guidance reflects reported policies. This reports a pending command, not a card-provided
+touch-wait signal. It clears on completion/failure/lock and late events cannot
+restore it after lock. No PIN is retained for these notifications.
 If setup fails after generating one key, that generated key remains. The current
 UI refuses partial setup instead of guessing how to reuse an occupied slot.
 
@@ -251,7 +267,7 @@ XDG data directories and synthetic wallets for smoke tests. No source checkout
 commits or staging are performed by development checks; temporary wallet histories
 are created by tests.
 
-With `smoke`, `KAGITABA_SMOKE_SCENE=home|wallet|create|unlock|import|review|keys|transfer`
+With `smoke`, `KAGITABA_SMOKE_SCENE=home|wallet|create|provision|touch|unlock|import|review|keys|transfer`
 loads synthetic, disconnected UI fixtures (no hardware/credential reads or worker
 writes). `KAGITABA_SMOKE_NARROW=1` selects a 440×780 viewport. Combine with
 `EFRAME_SCREENSHOT_TO=/absolute/path.png` in a virtual display. These switches

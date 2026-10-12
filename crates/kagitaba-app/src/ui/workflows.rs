@@ -64,11 +64,16 @@ impl App {
                 app.clear_secrets();
                 app.screen = Screen::Unlock;
             }
-            "create" => {
+            "create" | "provision" => {
                 app.clear_secrets();
                 app.wallet = None;
                 app.create_path = Some("/home/example/Wallets/New wallet".into());
                 app.screen = Screen::Create;
+                app.provision = scene == "provision";
+            }
+            "touch" => {
+                app.busy = true;
+                app.private_operation = Some(Some(TouchPolicy::Always));
             }
             _ => {}
         }
@@ -189,6 +194,7 @@ impl App {
         }
         ui.separator();
         self.remote_ui(ui);
+        self.touch_progress_ui(ui);
         if self.busy || !self.status.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 if self.busy {
@@ -456,6 +462,19 @@ impl App {
         }
     }
 
+    fn touch_progress_ui(&self, ui: &mut egui::Ui) {
+        if let Some(policy) = self.private_operation {
+            ui.horizontal_wrapped(|ui| {
+                ui.spinner();
+                ui.colored_label(theme::AQUA, match policy {
+                    Some(TouchPolicy::Always) => "Waiting for YubiKey confirmation — touch the key when it flashes.",
+                    Some(TouchPolicy::Cached) => "YubiKey operation pending — touch if it flashes; a recent touch may still be cached.",
+                    Some(TouchPolicy::Never) => "Waiting for the YubiKey — no touch required by this slot.",
+                    None | Some(TouchPolicy::Unknown(_)) => "YubiKey operation pending — touch the key if it flashes (policy unavailable).",
+                });
+            });
+        }
+    }
     fn entry_modal(&mut self, ctx: &egui::Context) {
         let id = egui::Id::new("entry-detail-modal");
         let size = egui::vec2(
@@ -480,10 +499,11 @@ impl App {
                         self.request_lock();
                     }
                 });
+                self.touch_progress_ui(ui);
                 egui::ScrollArea::vertical()
                     .id_salt("modal-details")
                     .auto_shrink([false, false])
-                    .max_height((ctx.content_rect().height() - 150.0).max(100.0))
+                    .max_height(ui.available_height().max(100.0))
                     .show(ui, |ui| {
                         ui.add_enabled_ui(!self.busy, |ui| self.entry_ui(ui));
                     });

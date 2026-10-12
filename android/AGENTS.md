@@ -55,8 +55,16 @@ requires explicit checkbox consent, the existing PIV PIN and management key;
 a factory-management-key button is an explicit convenience, never an automatic
 attempt. Both slots and device serial are checked before authentication/mutation;
 each generation also checks emptiness. No overwrites, resets, PIN changes or
-automatic retries. Encryption touch is cached and signing requires touch, matching
-native provisioning. Partial generation failures cannot be rolled back and tell
+automatic retries. New-slot policy pickers default to PIN Once for both keys,
+encryption touch Cached and signing touch Always, matching native provisioning.
+Each offers PIN Once/Never and touch Never/Always/Cached; changes clear consent.
+PIN Always needs per-operation PIN prompts and is not offered. The PIV PIN label
+is bold; Kagitaba still verifies a PIN on unlock with hardware PIN Never.
+Existing device-reported policies are read-only in the slot/participant chooser
+and Settings. Unknown bytes are displayed without rejecting the public key.
+Existing PIN Always is explicitly marked unsupported for repeated operations.
+Policies are fixed at key creation; the UI never silently replaces keys.
+Partial generation failures cannot be rolled back and tell
 the user to inspect the device before retrying. Once generated, a separate create
 button signs the new wallet with that pair; retrying signing does not generate
 more keys. The genesis stores its serial and slots for future auto-detection.
@@ -73,8 +81,13 @@ Provider requests require fresh PIV PIN entry. Background provider enumeration
 returns an authentication action and never triggers hidden hardware touches.
 Provider/autofill saves perform optional synchronization in the foreground before
 closing the activity, because Git token decryption can also require a key touch.
-Keep the key connected/in NFC range for private operations; configured touch
-policies apply. Leaving an activity stops NFC reader mode, so subsequent provider
+All SecureActivity screens show pending private-command guidance through the
+Rust session observer and JNI PivConnection callback (kept for name-based lookup).
+The banner distinguishes Always/Cached/Never; it cannot observe an actual card
+touch-wait signal. Completion, failure and lock clear it, and callbacks from old
+connections are ignored. Provisioning also gives conditional touch guidance for
+management authentication. Keep the key connected/in NFC range for private
+operations; configured touch policies apply. Leaving an activity stops NFC reader mode, so subsequent provider
 steps may require another tap/unlock. USB removal locks the wallet. NFC loss is
 detected by the next operation; no cached PIN is used to reconnect silently.
 

@@ -30,6 +30,11 @@ it requires no hosted service. The extension ID is `firefox@kagitaba.local`.
 Firefox 150+ permits this RP ID through HTTPS host permission. Enrollment requests
 a non-discoverable cross-platform ES256 credential with PIN verification; no
 password/ordinary-assertion fallback exists. Actual hardware validation is pending.
+Enrollment, unlock and approval explain that Firefox requests a **FIDO PIN**
+(bold in the app UI) and physical touch. Firefox owns the actual PIN dialog;
+Kagitaba cannot restyle it or detect the precise PIN-versus-touch phase.
+Pending WebAuthn requests are aborted on lock and late results are suppressed.
+PIV slot policy settings belong to native/Android, not this FIDO participant.
 
 The public participant request contains encryption/signing public keys only.
 The PRF parameters and encrypted installation identity remain in local IndexedDB;

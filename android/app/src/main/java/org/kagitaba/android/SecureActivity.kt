@@ -14,6 +14,20 @@ open class SecureActivity : FragmentActivity() {
     protected lateinit var vault: Vault
     protected lateinit var panel: LinearLayout
     protected lateinit var notice: TextView
+    private var touchNotice: TextView? = null
+    private val onTouch: () -> Unit = { runOnUiThread { showTouchProgress() } }
+    private fun showTouchProgress() {
+        val policy = vault.device.touchPolicy
+        touchNotice?.apply {
+            visibility = if (policy < 0) View.GONE else View.VISIBLE
+            text = when (policy) {
+                1 -> "Waiting for the YubiKey — this slot requires no touch."
+                2 -> "Waiting for YubiKey confirmation — touch the key when it flashes. Keep it connected or in NFC range."
+                3 -> "YubiKey operation pending — touch if it flashes; a recent touch may still be cached. Keep it connected or in NFC range."
+                else -> "YubiKey operation pending — touch if it flashes. Keep it connected or in NFC range."
+            }
+        }
+    }
     protected var busy = false
     private var backAction: (() -> Unit)? = null
     private val activeWork = mutableSetOf<kotlinx.coroutines.Job>()
@@ -31,10 +45,11 @@ open class SecureActivity : FragmentActivity() {
         })
     }
     protected fun bindVault(value: Vault) {
-        if (::vault.isInitialized) vault.lockListeners.remove(onLock)
+        if (::vault.isInitialized) { vault.lockListeners.remove(onLock); vault.device.touchListeners.remove(onTouch) }
         vault = value; vault.lockListeners.add(onLock)
+        vault.device.touchListeners.add(onTouch)
     }
-    override fun onDestroy() { vault.lockListeners.remove(onLock); super.onDestroy() }
+    override fun onDestroy() { vault.lockListeners.remove(onLock); vault.device.touchListeners.remove(onTouch); super.onDestroy() }
     override fun onUserInteraction() { super.onUserInteraction(); (application as KagitabaApp).touch() }
     protected open fun locked() { screen("Wallet locked"); button("Unlock", primary = true) { authenticate { recreate() } } }
     protected fun screen(title: String, back: (() -> Unit)? = null) {
@@ -56,6 +71,12 @@ open class SecureActivity : FragmentActivity() {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, WalletTheme.dp(context, 48))
         })
         root.addView(header)
+        touchNotice = TextView(this).also {
+            it.setTextColor(WalletTheme.accent); it.setTypeface(it.typeface, android.graphics.Typeface.BOLD)
+            it.setPadding(spacing, 8, spacing, 8); it.accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            root.addView(it)
+        }
+        showTouchProgress()
         root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         root.setOnApplyWindowInsetsListener { view, insets ->
             val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())

@@ -9,7 +9,9 @@ use kagitaba_core::{
     wallet::{Entry, GrantRecord, PrimaryRecord},
 };
 use kagitaba_cxf::Payload;
-use kagitaba_device::{Piv, Session, Slots, Transport};
+use kagitaba_device::{
+    KeyPolicy, PinPolicy, Piv, Policies, PrivateOperation, Session, Slots, TouchPolicy, Transport,
+};
 use kagitaba_store::Signer;
 use rand_core::{TryCryptoRng, TryRng};
 use serde_json::{Value, json};
@@ -82,7 +84,7 @@ pub(super) fn open(env: &mut JNIEnv<'_>, connection: JObject<'_>, input: &str) -
     let v = &request.0;
     let transport = AndroidTransport {
         vm: env.get_java_vm().map_err(err)?,
-        connection: env.new_global_ref(connection).map_err(err)?,
+        connection: env.new_global_ref(&connection).map_err(err)?,
     };
     let mut card = Piv::new(transport).map_err(err)?;
     if v["op"] == "inspect" {
@@ -91,15 +93,19 @@ pub(super) fn open(env: &mut JNIEnv<'_>, connection: JObject<'_>, input: &str) -
     if v["op"] == "inspect_slots" {
         let mut empty = Vec::new();
         let mut occupied = Vec::new();
+        let mut policies = serde_json::Map::new();
         for slot in 0x82..=0x95 {
-            match card.public_key(slot) {
+            match card.key_metadata(slot) {
                 Err(kagitaba_device::Error::Status(0x6a88)) => empty.push(slot),
-                Ok(_) => occupied.push(slot),
+                Ok(metadata) => {
+                    occupied.push(slot);
+                    policies.insert(slot.to_string(), policy_json(metadata.policy));
+                }
                 Err(kagitaba_device::Error::Unsupported) => {}
                 Err(e) => return Err(err(e)),
             }
         }
-        return Ok(json!({"serial":card.serial_number().map_err(err)?.to_string(), "emptySlots":empty, "occupiedSlots":occupied}).to_string());
+        return Ok(json!({"serial":card.serial_number().map_err(err)?.to_string(), "emptySlots":empty, "occupiedSlots":occupied,"policies":policies}).to_string());
     }
     let slot = |name| -> Result<u8> {
         u8::try_from(v[name].as_u64().ok_or("Invalid PIV slots")?).map_err(err)
@@ -107,6 +113,9 @@ pub(super) fn open(env: &mut JNIEnv<'_>, connection: JObject<'_>, input: &str) -
     let slots = Slots::new(slot("encryptionSlot")?, slot("signingSlot")?).map_err(err)?;
     let serial = card.serial_number().map_err(err)?.to_string();
     if v["op"] == "provision" {
+        let defaults = Policies::default();
+        let encryption_policy = requested_policy(v, "encryptionPolicy", defaults.encryption)?;
+        let signing_policy = requested_policy(v, "signingPolicy", defaults.signing)?;
         if v["confirmed"].as_bool() != Some(true) {
             return Err("Confirm generation in the selected empty PIV slots.");
         }
@@ -138,7 +147,7 @@ pub(super) fn open(env: &mut JNIEnv<'_>, connection: JObject<'_>, input: &str) -
         card.verify_pin(text(v, "pin")?).map_err(pin_error)?;
         card.authenticate_management(&key)
             .map_err(|_| "Management authentication failed. No keys were generated.")?;
-        card.generate_empty(slots.encryption(), true).and_then(|_| card.generate_empty(slots.signing(), false))
+        card.generate_empty_with_policy(slots.encryption(), encryption_policy).and_then(|_| card.generate_empty_with_policy(slots.signing(), signing_policy))
             .map_err(|_| "Provisioning stopped. A slot may now contain a generated key. Inspect the slots on your computer before trying again.")?;
     }
     // Recheck public keys on the connection actually receiving the PIN, before
@@ -155,10 +164,31 @@ pub(super) fn open(env: &mut JNIEnv<'_>, connection: JObject<'_>, input: &str) -
             );
         }
     }
-    let session = Session::unlock_with_slots(card, text(v, "pin")?, slots).map_err(pin_error)?;
+    let mut session =
+        Session::unlock_with_slots(card, text(v, "pin")?, slots).map_err(pin_error)?;
+    let callback = env.new_global_ref(&connection).map_err(err)?;
+    let vm = env.get_java_vm().map_err(err)?;
+    session.set_observer(move |event| {
+        let policy = match event {
+            PrivateOperation::Finished => -1,
+            PrivateOperation::Started(touch) => touch.map_or(0, |p| i32::from(p.code())),
+        };
+        if let Ok(mut env) = vm.attach_current_thread() {
+            let _ = env.call_method(
+                callback.as_obj(),
+                "setTouchPending",
+                "(I)V",
+                &[JValue::Int(policy)],
+            );
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+        }
+    });
     let handle = NEXT.fetch_add(1, Ordering::Relaxed);
     let response = json!({"identity": format!("piv:{handle}"), "participantId": session.encryption.id().to_string(),
         "participantPem": session.encryption.to_pem(), "signingId": session.signing.id().to_string(), "signingPem": session.signing.to_pem(),
+        "encryptionPolicy":policy_json(session.encryption_policy), "signingPolicy":policy_json(session.signing_policy),
         "device": {"version":1,"serial":serial,"encryptionSlot":slots.encryption(),"signingSlot":slots.signing()}});
     let mut all = sessions().lock().map_err(err)?;
     if all.len() >= 4 {
@@ -166,6 +196,29 @@ pub(super) fn open(env: &mut JNIEnv<'_>, connection: JObject<'_>, input: &str) -
     }
     all.insert(handle, Arc::new(Hardware(session)));
     Ok(response.to_string())
+}
+fn policy_json(policy: Option<KeyPolicy>) -> Value {
+    policy.map_or(
+        Value::Null,
+        |p| json!({"pin":p.pin.code(), "touch":p.touch.code()}),
+    )
+}
+fn requested_policy(v: &Value, name: &str, default: KeyPolicy) -> Result<KeyPolicy> {
+    let Some(value) = v.get(name) else {
+        return Ok(default);
+    };
+    let pin = match value["pin"].as_u64() {
+        Some(1) => PinPolicy::Never,
+        Some(2) => PinPolicy::Once,
+        _ => return Err("Unsupported PIV policy selection."),
+    };
+    let touch = match value["touch"].as_u64() {
+        Some(1) => TouchPolicy::Never,
+        Some(2) => TouchPolicy::Always,
+        Some(3) => TouchPolicy::Cached,
+        _ => return Err("Unsupported PIV policy selection."),
+    };
+    Ok(KeyPolicy { pin, touch })
 }
 fn pin_error(e: kagitaba_device::Error) -> &'static str {
     match e {
@@ -258,6 +311,18 @@ fn detect<T: Transport>(card: &mut Piv<T>, request: &Value) -> Result<Value> {
             matches.push(json!({"participantId": encryption.id().to_string(), "participantPem": encryption.to_pem(),
                 "signingPem": signing.to_pem(), "name": candidate["name"].as_str().unwrap_or(""), "serial": serial,
                 "encryptionSlot": enc, "signingSlot": sig}));
+        }
+    }
+    for item in &mut matches {
+        for (slot, policy) in [
+            ("encryptionSlot", "encryptionPolicy"),
+            ("signingSlot", "signingPolicy"),
+        ] {
+            item[policy] = policy_json(
+                card.key_metadata(item[slot].as_u64().ok_or("Invalid PIV slots")? as u8)
+                    .map_err(err)?
+                    .policy,
+            );
         }
     }
     Ok(json!({"matches":matches}))
@@ -390,4 +455,33 @@ pub(super) fn execute(input: &str, random: Vec<u8>) -> Result<String> {
     };
     let result = super::store::Secret(result);
     serde_json::to_string(&result.0).map_err(err)
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    #[test]
+    fn provisioning_policy_defaults_and_validation() {
+        let default = Policies::default().encryption;
+        assert_eq!(
+            requested_policy(&json!({}), "policy", default).unwrap(),
+            default
+        );
+        assert_eq!(
+            requested_policy(&json!({"policy":{"pin":1,"touch":2}}), "policy", default).unwrap(),
+            KeyPolicy {
+                pin: PinPolicy::Never,
+                touch: TouchPolicy::Always
+            }
+        );
+        for value in [
+            json!({"pin":3,"touch":2}),
+            json!({"pin":0,"touch":2}),
+            json!({"pin":2,"touch":0}),
+            json!({"pin":2}),
+            Value::Null,
+        ] {
+            assert!(requested_policy(&json!({"policy":value}), "policy", default).is_err());
+        }
+    }
 }

@@ -2,6 +2,7 @@ use crate::backend::{Command, Event};
 use crate::{preferences::Preferences, theme};
 use eframe::egui;
 use kagitaba_core::{EntryId, KeyId};
+use kagitaba_device::{KeyPolicy, Policies, PinPolicy, TouchPolicy, PrivateOperation};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -75,6 +76,9 @@ pub struct App {
     device: usize,
     encryption_slot: u8,
     signing_slot: u8,
+    policies: Policies,
+    device_policies: Option<(Option<KeyPolicy>, Option<KeyPolicy>)>,
+    private_operation: Option<Option<TouchPolicy>>,
     pin: String,
     management: String,
     provision: bool,
@@ -163,6 +167,9 @@ impl App {
             device: 0,
             encryption_slot: kagitaba_device::ENCRYPTION_SLOT,
             signing_slot: kagitaba_device::SIGNING_SLOT,
+            policies: Policies::default(),
+            device_policies: None,
+            private_operation: None,
             pin: String::new(),
             management: String::new(),
             provision: false,
@@ -244,6 +251,8 @@ impl App {
         self.import_recipients.clear();
         self.reveal = false;
         self.unlocked = None;
+        self.device_policies = None;
+        self.private_operation = None;
         self.leave_action = None;
         self.participant_preview = None;
         self.consent = false;
@@ -271,6 +280,11 @@ impl App {
                 continue;
             }
             match e {
+                Event::Policies(encryption, signing) => self.device_policies = Some((encryption, signing)),
+                Event::PrivateOperation(event) => self.private_operation = match event {
+                    PrivateOperation::Started(policy) => Some(policy),
+                    PrivateOperation::Finished => None,
+                },
                 Event::Devices(d) => {
                     self.devices = d;
                     self.device = 0;
@@ -667,6 +681,7 @@ impl App {
         }
         if let Some(id) = &self.unlocked {
             ui.colored_label(theme::AQUA, format!("Key ready · {}…", &id[..16]));
+            self.device_policies_ui(ui);
             if ui
                 .add_enabled(
                     self.wallet.is_some(),
@@ -677,7 +692,7 @@ impl App {
                 self.send(Command::RememberDevice);
             }
         } else {
-            ui.label("PIV PIN");
+            ui.label(egui::RichText::new("PIV PIN").font(egui::FontId::new(16.0, egui::FontFamily::Name("bold".into()))));
             ui.add(egui::TextEdit::singleline(&mut self.pin).password(true));
             if ui
                 .add_enabled(
@@ -709,7 +724,24 @@ impl App {
         }
         if self.provision {
             ui.label(format!("Generates P-256 keys in PIV slots {:02X} and {:02X}. Occupied slots are never overwritten. FIDO credentials remain untouched.", self.encryption_slot, self.signing_slot));
-            ui.label("Encryption touch is cached briefly; signing requires a touch. Uses your existing PIV PIN and management key.");
+            let previous = self.policies;
+            for (label, policy) in [("Encryption", &mut self.policies.encryption), ("Signing", &mut self.policies.signing)] {
+                ui.strong(label);
+                egui::ComboBox::from_id_salt((label, "pin"))
+                    .selected_text(format!("PIN: {:?}", policy.pin)).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut policy.pin, PinPolicy::Once, "Once per session (default)");
+                        ui.selectable_value(&mut policy.pin, PinPolicy::Never, "Never — no hardware PIN requirement");
+                    });
+                egui::ComboBox::from_id_salt((label, "touch"))
+                    .selected_text(format!("Touch: {:?}", policy.touch)).show_ui(ui, |ui| {
+                        for value in [TouchPolicy::Never, TouchPolicy::Always, TouchPolicy::Cached] {
+                            ui.selectable_value(&mut policy.touch, value, format!("{value:?}"));
+                        }
+                    });
+            }
+            if previous != self.policies { self.consent = false; }
+            ui.label("Cached touch lasts briefly. PIN Always requires per-operation PIN prompts, which are not supported. Kagitaba still asks for a PIV PIN to unlock with PIN Never.");
+            ui.label("Policies are fixed when each key is created. Changing them later requires replacing that key.");
             ui.label("Management key (hex)");
             ui.add(egui::TextEdit::singleline(&mut self.management).password(true));
             if ui.button("Use factory management key").clicked() {
@@ -736,8 +768,22 @@ impl App {
             {
                 let key = Zeroizing::new(std::mem::take(&mut self.management));
                 let pin = Zeroizing::new(std::mem::take(&mut self.pin));
-                self.send(Command::Provision(d, slots, key, pin));
+                self.send(Command::Provision(d, slots, self.policies, key, pin));
                 self.consent = false;
+            }
+        }
+    }
+    fn device_policies_ui(&self, ui: &mut egui::Ui) {
+        if let Some((encryption, signing)) = self.device_policies {
+            ui.label("Current policies reported by the YubiKey (read-only):");
+            for (label, policy) in [("Encryption", encryption), ("Signing", signing)] {
+                ui.label(match policy {
+                    Some(p) => format!("{label}: PIN {:?} · touch {:?}", p.pin, p.touch),
+                    None => format!("{label}: policies unavailable from device"),
+                });
+                if policy.is_some_and(|p| p.pin == PinPolicy::Always) {
+                    ui.colored_label(theme::ERROR, "PIN Always needs a fresh PIN for every operation; repeated operations with this key are not supported.");
+                }
             }
         }
     }
@@ -1463,6 +1509,7 @@ mod tests {
         let participant = KeyId::from_bytes([4; 32]);
         app.unlocked = Some("device".into());
         app.busy = true;
+        app.private_operation = Some(Some(TouchPolicy::Always));
         app.json = "visible secret".into();
         app.titles
             .insert(id, Zeroizing::new("private title".into()));
@@ -1472,10 +1519,12 @@ mod tests {
         assert!(matches!(commands.try_recv(), Ok(Command::Lock)));
         assert!(app.json.is_empty() && app.titles.is_empty() && app.unlocked.is_none());
         assert!(app.participant_names.is_empty());
+        assert!(app.private_operation.is_none());
         app.enforce_idle_lock(Instant::now());
         assert!(commands.try_recv().is_err());
         for event in [
             Event::Locked,
+            Event::PrivateOperation(PrivateOperation::Started(Some(TouchPolicy::Always))),
             Event::Entry(id, Zeroizing::new("late secret".into()), vec![]),
             Event::Titles(vec![(id, Zeroizing::new("late title".into()))]),
             Event::ParticipantNames(BTreeMap::from([(participant, "late private name".into())])),
@@ -1493,6 +1542,7 @@ mod tests {
         }
         app.events();
         assert!(app.locking && app.busy);
+        assert!(app.private_operation.is_none());
         assert!(
             app.json.is_empty()
                 && app.titles.is_empty()

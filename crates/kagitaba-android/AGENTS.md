@@ -28,7 +28,17 @@ The same bridge supports PIN-free `inspect` (verified wallet candidates) and
 keys; hints route discovery but cannot authorize it. `provision` requires explicit
 confirmation, selected serial and two slots proven empty before any writes, then
 uses the native management authentication/generation implementation. Never retry
-failed PINs or overwrite slots. Store snapshots expose public `devices` and
+failed PINs or overwrite slots.
+`provision` accepts separate `encryptionPolicy`/`signingPolicy` objects with
+numeric `pin` (1 Never, 2 Once) and `touch` (1 Never, 2 Always, 3 Cached).
+Omitted policy objects use existing defaults; invalid/unsupported choices fail
+before hardware mutation. Slot discovery, matched participants and opened
+sessions expose actual device policy bytes, including unknown values, or null
+when unavailable. These are display metadata, not signed routing hints.
+The session observer calls the kept `PivConnection.setTouchPending(int)` method
+around private commands: reported touch byte while pending, -1 on completion;
+0 means unavailable. Notifications contain no secrets and do not prove that a
+card is currently waiting for touch. Store snapshots expose public `devices` and
 `signingKeys` for clone-before-unlock routing, and creation persists the selected
 device hint in the signed genesis. Kotlin isolates each wallet's storage/trust.
 

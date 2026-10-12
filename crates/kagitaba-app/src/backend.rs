@@ -2,7 +2,7 @@ use futures::executor::block_on;
 use kagitaba_core::{EntryId, KeyId, crypto::PublicKey};
 use kagitaba_cxf::{Document, ImportPlan, Payload};
 use kagitaba_device::{
-    Piv, Session, Slots,
+    Piv, Session, Slots, Policies, KeyPolicy, PrivateOperation,
     usb::{self, Device, Usb},
 };
 use kagitaba_store::{DeviceHint, Signer, Snapshot, Store};
@@ -33,7 +33,7 @@ pub enum Command {
     Close,
     DiscardImport,
     RememberDevice,
-    Provision(Device, Slots, Zeroizing<String>, Zeroizing<String>),
+    Provision(Device, Slots, Policies, Zeroizing<String>, Zeroizing<String>),
     Create(PathBuf),
     Open(PathBuf, Option<String>),
     ExportParticipant(PathBuf),
@@ -57,6 +57,8 @@ pub enum Command {
     Backup(PathBuf),
 }
 pub enum Event {
+    Policies(Option<KeyPolicy>, Option<KeyPolicy>),
+    PrivateOperation(PrivateOperation),
     Devices(Vec<Device>),
     DeviceHints(BTreeMap<KeyId, DeviceHint>),
     ParticipantNames(BTreeMap<KeyId, String>),
@@ -85,6 +87,7 @@ pub fn start(ctx: eframe::egui::Context) -> (mpsc::Sender<Command>, mpsc::Receiv
     std::thread::spawn(move || {
         let remote = crate::remote::start(ctx.clone(), events.clone());
         let mut worker = Worker {
+            ctx: ctx.clone(),
             session: None,
             session_device: None,
             store: None,
@@ -124,12 +127,23 @@ pub fn start(ctx: eframe::egui::Context) -> (mpsc::Sender<Command>, mpsc::Receiv
     (tx, out)
 }
 struct Worker {
+    ctx: eframe::egui::Context,
     session: Option<Session<Usb>>,
     session_device: Option<DeviceHint>,
     store: Option<Store>,
     pending: Option<ImportPlan>,
 }
 impl Worker {
+    fn observe_session(&self, session: &mut Session<Usb>, events: &mpsc::Sender<Event>) -> Result<()> {
+        events.send(Event::Policies(session.encryption_policy, session.signing_policy))?;
+        let events = events.clone();
+        let ctx = self.ctx.clone();
+        session.set_observer(move |event| {
+            let _ = events.send(Event::PrivateOperation(event));
+            ctx.request_repaint();
+        });
+        Ok(())
+    }
     fn run(&mut self, c: Command, events: &mpsc::Sender<Event>) -> Result<()> {
         match c {
             Command::Remote(_) => unreachable!("transport is dispatched separately"),
@@ -204,15 +218,16 @@ impl Worker {
                 self.session_device = None;
                 let mut card = Piv::new(Usb::open(&d)?)?;
                 let hint = device_hint(&mut card, slots)?;
-                let s = Session::unlock_with_slots(card, &pin, slots)?;
+                let mut s = Session::unlock_with_slots(card, &pin, slots)?;
                 if let (Some(store), Some(hint)) = (&self.store, &hint) {
                     verify_device_hint(&store.snapshot, hint, &s.encryption, &s.signing)?;
                 }
+                self.observe_session(&mut s, events)?;
                 events.send(Event::Unlocked(s.encryption.id().to_string()))?;
                 self.session_device = hint;
                 self.session = Some(s);
             }
-            Command::Provision(d, slots, management, pin) => {
+            Command::Provision(d, slots, policies, management, pin) => {
                 self.session = None;
                 self.session_device = None;
                 let mut card = Piv::new(Usb::open(&d)?)?;
@@ -229,10 +244,15 @@ impl Worker {
                 }
                 card.verify_pin(&pin)?;
                 let key = Zeroizing::new(hex::decode(management.trim())?);
-                card.authenticate_management(&key)?;
-                card.generate_empty(slots.encryption(), true)?;
-                card.generate_empty(slots.signing(), false)?;
-                let s = Session::unlock_with_slots(card, &pin, slots)?;
+                events.send(Event::PrivateOperation(PrivateOperation::Started(None)))?;
+                self.ctx.request_repaint();
+                let authentication = card.authenticate_management(&key);
+                events.send(Event::PrivateOperation(PrivateOperation::Finished))?;
+                authentication?;
+                card.generate_empty_with_policy(slots.encryption(), policies.encryption)?;
+                card.generate_empty_with_policy(slots.signing(), policies.signing)?;
+                let mut s = Session::unlock_with_slots(card, &pin, slots)?;
+                self.observe_session(&mut s, events)?;
                 events.send(Event::Unlocked(s.encryption.id().to_string()))?;
                 self.session_device = hint;
                 self.session = Some(s);

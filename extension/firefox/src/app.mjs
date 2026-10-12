@@ -4,6 +4,8 @@ const params = new URLSearchParams(location.search), requestId = params.get('req
 let tabId = Number(params.get('tab'));
 async function openEntry(id, parent) {const draft=await send({type:'entry-draft',id});showEntry(JSON.parse(draft.payload),id,parent,draft);}
 let state, uiEpoch=0;
+let fidoPending;
+class FidoLockedError extends Error {constructor(){super('Wallet locked. Unlock to continue.');}}
 let connectionDraft = {}, settingsDraft = {}, view = 'wallet', selectedId = null, search = '', dirty = false, busy = false, renderVersion = 0, fieldNumber = 0, requestFinished = false;
 const send = async message => {const captured=uiEpoch;const value=await browser.runtime.sendMessage(message);if(captured!==uiEpoch && !['lock','connect','status','sync'].includes(message.type))throw new Error('Wallet locked. Unlock to continue.');return value;};
 function el(tag, content, className) {const node = document.createElement(tag); if (content !== undefined) node.textContent = content; if(className) node.className = className; return node;}
@@ -12,22 +14,29 @@ function field(parent, label, value = '', type = 'text') {const caption=el('labe
 function check(parent,label,value){const row=el('label',undefined,'check'),input=el('input');input.type='checkbox';input.checked=value;row.append(input,el('span',label));parent.append(row);return input;}
 function disclosure(parent,title){const node=el('details');node.append(el('summary',title));parent.append(node);return node;}
 function feedback(text='',kind='info'){notice.textContent=text;notice.dataset.kind=kind;notice.hidden=!text;}
+function fidoPrompt(){feedback('','progress');notice.hidden=false;notice.append('Waiting for security-key confirmation. Follow Firefox’s prompt: enter your ',el('strong','FIDO PIN'),' and touch the key when requested. Firefox controls the PIN and touch prompts.');}
+function fidoInstructions(){const node=el('p');node.append('Connect your security key. Firefox will ask for its ',el('strong','FIDO PIN'),' and a touch.');return node;}
+async function fidoRequest(method, options){
+  const epoch=uiEpoch, controller=new AbortController();fidoPending=controller;fidoPrompt();
+  try{const credential=await navigator.credentials[method]({...options,signal:controller.signal});if(epoch!==uiEpoch)throw new FidoLockedError();return credential;}
+  catch(error){if(epoch!==uiEpoch)throw new FidoLockedError();throw error;}
+  finally{if(fidoPending===controller)fidoPending=undefined;}
+}
 function controls(){app.setAttribute('aria-busy',String(busy));for(const b of app.querySelectorAll('button'))b.disabled=busy;}
 function canLeave(){if(dirty&&!confirm('Discard your unsaved changes?'))return false;dirty=false;return true;}
 async function navigate(next){if(!canLeave())return;view=next;selectedId=null;await render();feedback();}
 function section(title) {const node = el('section'); node.append(el('h2', title)); app.append(node); return node;}
-async function run(action, control) {if(busy)return;busy=true;controls();feedback(`${control?.textContent??'Working'}…`,'progress');try{await action();if(notice.dataset.kind==='progress')feedback('Done.','success');}catch(error){feedback(error.message||'Operation failed. Please retry.','error');}finally{busy=false;controls();}}
+async function run(action, control) {if(busy)return;busy=true;controls();feedback(`${control?.textContent??'Working'}…`,'progress');try{await action();if(notice.dataset.kind==='progress')feedback('Done.','success');}catch(error){if(!(error instanceof FidoLockedError))feedback(error.message||'Operation failed. Please retry.','error');}finally{busy=false;controls();}}
 function download(name, value) {const url = URL.createObjectURL(new Blob([JSON.stringify(value)],{type:'application/json'})); const link = el('a'); link.href=url;link.download=name;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 async function assertion(unlock) {
-  feedback('Follow Firefox’s prompt: enter your security-key PIN and touch the key when requested.','progress');
-  const credential = await navigator.credentials.get({publicKey: {rpId: unlock.rpId, challenge: random(32), allowCredentials: [{type:'public-key',id:decode(unlock.credentialId)}], userVerification:'required', timeout:120000, extensions:{prf:{eval:{first:decode(unlock.prfInput)}}}}});
+  const credential = await fidoRequest('get',{publicKey: {rpId: unlock.rpId, challenge: random(32), allowCredentials: [{type:'public-key',id:decode(unlock.credentialId)}], userVerification:'required', timeout:120000, extensions:{prf:{eval:{first:decode(unlock.prfInput)}}}}});
   const output = credential?.getClientExtensionResults()?.prf?.results?.first;
   if (!output || !(new Uint8Array(credential.response.authenticatorData)[32] & 4)) throw new Error('This browser/key did not provide PRF with user verification. No alternative unlock is used.');
   return {prf: encode(output), uv:true};
 }
 async function setup() {
   const rpId = 'kagitaba.local', prfInput = encode(random(32));
-  const credential = await navigator.credentials.create({publicKey:{rp:{id:rpId,name:'Kagitaba wallet unlock'},user:{id:random(32),name:`Firefox ${new Date().toISOString().slice(0,10)}`,displayName:'Kagitaba installation'},challenge:random(32),pubKeyCredParams:[{type:'public-key',alg:-7}],authenticatorSelection:{residentKey:'discouraged',requireResidentKey:false,userVerification:'required',authenticatorAttachment:'cross-platform'},attestation:'none',timeout:120000,extensions:{prf:{eval:{first:decode(prfInput)}}}}});
+  const credential = await fidoRequest('create',{publicKey:{rp:{id:rpId,name:'Kagitaba wallet unlock'},user:{id:random(32),name:`Firefox ${new Date().toISOString().slice(0,10)}`,displayName:'Kagitaba installation'},challenge:random(32),pubKeyCredParams:[{type:'public-key',alg:-7}],authenticatorSelection:{residentKey:'discouraged',requireResidentKey:false,userVerification:'required',authenticatorAttachment:'cross-platform'},attestation:'none',timeout:120000,extensions:{prf:{eval:{first:decode(prfInput)}}}}});
   if (!credential) throw new Error('Security key enrollment cancelled');
   const unlock = {rpId,prfInput,credentialId:encode(credential.rawId)};
   const proof = await assertion(unlock);
@@ -39,7 +48,7 @@ async function render() {
   const version=++renderVersion,next=await send({type:'status'});if(version!==renderVersion)return;state=next;app.replaceChildren();
   document.querySelector('#lock').hidden=!state.unlocked;
   document.querySelector('#header-state').textContent=state.unlocked?'Unlocked':'Locked';
-  if(!state.installation){const node=section('1 · Protect this installation');node.append(el('p','Connect your security key. Firefox will ask for its PIN and a touch.'),button('Enroll security key',setup,true),el('p','Reinstalling requires new enrollment in your wallet.','muted'));controls();return;}
+  if(!state.installation){const node=section('1 · Protect this installation');node.append(fidoInstructions(),button('Enroll security key',setup,true),el('p','Reinstalling requires new enrollment in your wallet.','muted'));controls();return;}
   if(requestId){await renderRequest();return;}
   if(!state.replica.head){renderConnect();return;}
   const nav=el('nav',undefined,'tabs');nav.setAttribute('aria-label','Wallet navigation');for(const [key,label] of [['wallet','Wallet'],['settings','Settings']]){const b=button(label,()=>navigate(key));b.setAttribute('aria-current',String(key==='wallet'?view==='wallet':view!=='wallet'));nav.append(b);}app.append(nav);
@@ -144,7 +153,7 @@ async function renderRequest() {
 document.querySelector('#lock').onclick=async()=>{try{await send({type:'lock'});}catch{feedback('Unable to lock wallet.','error');}};
 browser.runtime.onMessage.addListener(message=>{
   if(message.type==='active-site'&&!requestId&&!dirty&&!busy){tabId=message.tabId;selectedId=null;render().catch(()=>{});}
-  if(message.type==='locked'){if(message.reason!=='connect'){connectionDraft.password='';settingsDraft.password='';}uiEpoch++;renderVersion++;dirty=false;selectedId=null;app.replaceChildren();document.querySelectorAll('dialog').forEach(dialog=>dialog.remove());render().catch(()=>{});if(!busy)feedback('Wallet locked.');}
+  if(message.type==='locked'){fidoPending?.abort();if(message.reason!=='connect'){connectionDraft.password='';settingsDraft.password='';}uiEpoch++;renderVersion++;dirty=false;selectedId=null;app.replaceChildren();document.querySelectorAll('dialog').forEach(dialog=>dialog.remove());render().catch(()=>{});feedback('Wallet locked.');}
   if(message.type==='sync-progress'){const phases={fetching:'Fetching wallet updates…',verifying:'Verifying signed wallet history…',pushing:'Uploading encrypted changes…'};if(phases[message.phase]&&!busy)feedback(phases[message.phase],'progress');}
   if(message.type==='sync-result'&&!busy){feedback(message.error??message.warning??(message.outcome==='pulled'?'Downloaded and verified wallet updates.':message.outcome==='pushed'?'Your saved changes are synchronized.':'Wallet is up to date.'),message.error?'error':message.warning?'info':'success');if(!dirty)render().catch(()=>{});}
 });
