@@ -34,6 +34,20 @@ fn cose(secret: &p256::SecretKey) -> Vec<u8> {
     bytes(&mut result, &point.as_bytes()[33..]);
     result
 }
+fn backup_flags(request: &Value) -> Result<u8> {
+    let Some(flags) = request.get("kagitabaBackupFlags") else {
+        return Ok(0x08);
+    };
+    let eligible = flags
+        .get("eligible")
+        .and_then(Value::as_bool)
+        .ok_or(Error)?;
+    let state = flags.get("state").and_then(Value::as_bool).ok_or(Error)?;
+    if state && !eligible {
+        return Err(Error);
+    }
+    Ok(if eligible { 0x08 } else { 0 } | if state { 0x10 } else { 0 })
+}
 fn auth_data(request: &Value, attested: bool) -> Result<Vec<u8>> {
     let rp = string(request, "rpId")?;
     if rp.is_empty()
@@ -45,8 +59,9 @@ fn auth_data(request: &Value, attested: bool) -> Result<Vec<u8>> {
         return Err(Error);
     }
     let uv = request.get("uv").and_then(Value::as_bool).ok_or(Error)?;
-    // UP; BE (software key can be backed up); BS remains false until known backed up.
-    let flags = 0x09 | if uv { 0x04 } else { 0 } | if attested { 0x40 } else { 0 };
+    // Preserve imported backup flags; legacy/new keys default to BE=true, BS=false.
+    let flags =
+        0x01 | backup_flags(request)? | if uv { 0x04 } else { 0 } | if attested { 0x40 } else { 0 };
     let mut data = Sha256::digest(rp.as_bytes()).to_vec();
     data.push(flags);
     data.extend_from_slice(&[0; 4]); // CXF import requires counter zero forever.
@@ -169,6 +184,7 @@ pub(super) fn operation(request: &Value, random: &mut Random) -> Result<Value> {
             Ok(result)
         }
         "passkey_validate" => {
+            backup_flags(request)?;
             let secret = p256::SecretKey::from_pkcs8_der(&binary(request, "privateKey")?)
                 .map_err(|_| Error)?;
             Ok(json!({"publicKey": b64(public(&secret)?.to_der()), "publicKeyAlgorithm": -7}))

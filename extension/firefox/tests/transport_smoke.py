@@ -125,7 +125,7 @@ def main():
             assert send({'type':'status'})['remoteAuth']['hasToken']
             stored=driver.execute_async_script("const done=arguments[arguments.length-1],r=indexedDB.open('kagitaba-installation');r.onsuccess=()=>{const db=r.result,q=db.transaction('records').objectStore('records').get('remote-auth');q.onsuccess=()=>{done(q.result);db.close();};};")
             assert stored['envelope'] and 'synthetic-token' not in json.dumps(stored)
-            driver.execute_script("[...document.querySelectorAll('button')].find(b=>b.textContent==='Synchronize').click();")
+            driver.execute_script("document.querySelector('#header-refresh button[aria-label=\"Synchronize\"]').click();")
             for _ in range(200):
                 if 'up to date' in driver.find_element('id','notice').text:break
                 time.sleep(.05)

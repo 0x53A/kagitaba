@@ -73,6 +73,13 @@ fn sessions() -> &'static Mutex<HashMap<u64, Arc<Hardware>>> {
 fn err(_: impl std::fmt::Display) -> &'static str {
     "PIV operation failed. Reconnect your YubiKey and unlock again."
 }
+const TOKEN_OTHER_KEY: &str = "Sync token belongs to another key. Unlock with that key or enter a Git token in Connection settings.";
+fn local_key_error(error: kagitaba_core::Error) -> &'static str {
+    match error {
+        kagitaba_core::Error::WrongRecipient => TOKEN_OTHER_KEY,
+        other => err(other),
+    }
+}
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v[key].as_str().ok_or("Invalid PIV request")
 }
@@ -375,6 +382,9 @@ pub(super) fn execute(input: &str, random: Vec<u8>) -> Result<String> {
             .cloned()
             .ok_or("YubiKey session expired. Unlock again.")?
     };
+    if op == "store_catalog" {
+        return super::index::execute(input, &*hardware, &hardware.0.encryption, &hardware.0, random);
+    }
     if op.starts_with("store_") {
         return super::store::execute_with(
             input,
@@ -443,7 +453,7 @@ pub(super) fn execute(input: &str, random: Vec<u8>) -> Result<String> {
                     context.as_bytes(),
                     &hardware.0,
                 ))
-                .map_err(err)?;
+                .map_err(local_key_error)?;
                 let clear = Ciphertext::from_bytes(&bytes(&envelope, "sealed")?)
                     .map_err(err)?
                     .open(&key, context.as_bytes())
@@ -483,5 +493,28 @@ mod policy_tests {
         ] {
             assert!(requested_policy(&json!({"policy":value}), "policy", default).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod local_token_tests {
+    use super::*;
+    use kagitaba_core::crypto::SoftwareIdentity;
+    use rand_core::SeedableRng;
+
+    #[test]
+    fn second_participant_token_mismatch_is_not_a_hardware_failure() {
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([31; 32]);
+        let first = SoftwareIdentity::generate(&mut rng).unwrap();
+        let second = SoftwareIdentity::generate(&mut rng).unwrap();
+        let key = ContentKey::generate(&mut rng).unwrap();
+        let context = b"synthetic sync token";
+        let wrapped = WrappedKey::wrap(&key, &first.public_key(), context, &mut rng).unwrap();
+        let result = futures::executor::block_on(wrapped.unwrap(&second.public_key(), context, &second))
+            .map_err(local_key_error);
+        assert!(matches!(result, Err(TOKEN_OTHER_KEY)));
+        assert!(futures::executor::block_on(wrapped.unwrap(&first.public_key(), context, &first)).is_ok());
+        assert_eq!(local_key_error(kagitaba_core::Error::KeyUnavailable), err("hardware"));
+        assert_eq!(local_key_error(kagitaba_core::Error::Authentication), err("authentication"));
     }
 }

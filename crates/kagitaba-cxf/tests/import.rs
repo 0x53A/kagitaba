@@ -369,3 +369,77 @@ fn construction_checks_nesting_of_the_complete_envelope() {
         block_on(Payload::open(&entry, &identity.public_key(), &identity)).unwrap();
     }
 }
+
+#[test]
+fn plain_cxf_cannot_activate_owned_attachments_without_their_blobs() {
+    use data_encoding::BASE64URL_NOPAD;
+    let external=json!({"type":"file","id":BASE64URL_NOPAD.encode(&[9;16]),"name":"example.pdf","decryptedSize":3,"integrityHash":BASE64URL_NOPAD.encode(&[0;32])});
+    let mut input=fixture();
+    input["accounts"][0]["items"][0]["credentials"].as_array_mut().unwrap().push(external.clone());
+    let source=parse(&input);
+    let plan=source.plan_import(&Wallet::default(),&mut rng()).unwrap();
+    assert_eq!(plan.report().external_files,1);
+    assert!(plan.entries().iter().any(|p|p.entity()["credentials"].as_array().is_some_and(|c|c.contains(&external))));
+    for marker in [Value::Null,json!({"version":1,"blobId":"01010101010101010101010101010101","key":BASE64URL_NOPAD.encode(&[3;32]),"chunkCount":1})] {
+        let mut owned=input.clone();
+        owned["accounts"][0]["items"][0]["credentials"].as_array_mut().unwrap().last_mut().unwrap()["kagitabaFile"]=marker;
+        let source=parse(&owned);
+        assert!(matches!(source.plan_import(&Wallet::default(),&mut rng()),Err(Error::OwnedAttachmentsUnsupported)));
+        let preserved:Value=serde_json::from_slice(&source.to_json().unwrap()).unwrap();
+        assert_eq!(preserved,owned);
+    }
+}
+
+#[test]
+fn opaque_type_breakdown_counts_types_without_credential_values() {
+    let mut input = fixture();
+    let credentials = input["accounts"][0]["items"][0]["credentials"].as_array_mut().unwrap();
+    credentials.push(json!({"type":"future-credential", "secret":"never in report"}));
+    credentials.push(json!({"type":"another-credential", "secret":"never in report"}));
+    credentials.push(json!({"type":"totp", "secret":"JBSWY3DPEHPK3PXP", "period":30,"digits":6,"algorithm":"future"}));
+    let plan = parse(&input).plan_import(&Wallet::default(), &mut rng()).unwrap();
+    let report = plan.report();
+    assert_eq!(report.opaque_credentials, 4);
+    assert_eq!(report.opaque_credential_types, std::collections::BTreeMap::from([
+        ("future-credential".into(), 2), ("another-credential".into(), 1), ("totp".into(), 1)
+    ]));
+    assert!(!format!("{report:?}").contains("never in report"));
+    assert_eq!(plan.report(), report);
+}
+
+#[test]
+fn supported_custom_fields_are_not_reported_as_unknown() {
+    let mut input = fixture();
+    let credentials = input["accounts"][0]["items"][0]["credentials"].as_array_mut().unwrap();
+    credentials.push(json!({"type":"custom-fields", "fields":[
+        {"label":"Pin","fieldType":"string","value":"synthetic"},
+        {"label":"Secret","fieldType":"concealed-string","value":"synthetic"},
+        {"label":"Enabled","fieldType":"boolean","value":"true"}
+    ]}));
+    let plan = parse(&input).plan_import(&Wallet::default(), &mut rng()).unwrap();
+    assert!(!plan.report().opaque_credential_types.contains_key("custom-fields"));
+    assert!(plan.entries().iter().any(|payload| payload.entity()["credentials"].as_array().is_some_and(|credentials| credentials.iter().any(|c| c["type"] == "custom-fields"))));
+}
+
+#[test]
+fn preserved_custom_field_groups_report_distinct_types_not_values() {
+    let mut input = fixture();
+    let credentials = input["accounts"][0]["items"][0]["credentials"].as_array_mut().unwrap();
+    credentials.push(json!({"type":"custom-fields", "fields":[
+        {"label":"Never in report A","fieldType":"email","value":"private@example.test"},
+        {"label":"Never in report B","fieldType":"email","value":"other@example.test"},
+        {"label":"Never in report C","fieldType":"number","value":"42"},
+        {"label":"Never in report D","fieldType":"string","value":"retained alongside unknown types"}
+    ]}));
+    credentials.push(json!({"type":"custom-fields", "fields":[
+        {"label":"Never in report E","fieldType":"number","value":"123"}
+    ]}));
+    let plan = parse(&input).plan_import(&Wallet::default(), &mut rng()).unwrap();
+    let report = plan.report();
+    assert_eq!(report.opaque_credential_types["custom-fields"], 2);
+    assert_eq!(report.preserved_custom_field_types, std::collections::BTreeMap::from([
+        ("email".into(), 2), ("number".into(), 2), ("string".into(), 1)
+    ]));
+    let summary = format!("{report:?}");
+    assert!(!summary.contains("Never in report") && !summary.contains("example.test") && !summary.contains("retained alongside"));
+}

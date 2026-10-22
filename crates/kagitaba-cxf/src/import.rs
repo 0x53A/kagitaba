@@ -12,7 +12,7 @@ use crate::{
 type IdMap = BTreeMap<(Vec<u8>, Vec<u8>), EntryId>;
 
 /// Non-secret counts that an import UI can display before accepting the plan.
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct ImportReport {
     /// Number of source accounts.
     pub accounts: usize,
@@ -26,8 +26,23 @@ pub struct ImportReport {
     pub unresolved_links: usize,
     /// Credential types retained opaquely, including unknown TOTP algorithms.
     pub opaque_credentials: usize,
+    /// Counts by CXF credential type; unknown TOTP algorithms count as `totp`.
+    pub opaque_credential_types: BTreeMap<String, usize>,
+    /// Individual field counts by fieldType within preserved custom-field groups.
+    /// These are field counts, not the credential-group count above; no values or labels.
+    pub preserved_custom_field_types: BTreeMap<String, usize>,
     /// File credentials whose external attachment bytes are not part of JSON.
     pub external_files: usize,
+}
+
+impl ImportReport {
+    fn record_opaque(&mut self, kind: &str) {
+        self.opaque_credentials += 1;
+        *self
+            .opaque_credential_types
+            .entry(kind.to_owned())
+            .or_default() += 1;
+    }
 }
 
 /// An import staged in memory. Creating/sealing it never mutates its source
@@ -35,6 +50,7 @@ pub struct ImportReport {
 pub struct ImportPlan {
     entries: Vec<Payload>,
     report: ImportReport,
+    reserved_ids: BTreeSet<EntryId>,
 }
 
 impl Document {
@@ -45,6 +61,8 @@ impl Document {
     ///
     /// Unknown extensions remain verbatim; opaque vendor-specific references
     /// cannot be rewritten. Their original namespace is retained in provenance.
+    /// Owned `kagitabaFile` descriptors are rejected: plain CXF cannot import the
+    /// associated owner-bound encrypted blobs. The source Document is unchanged.
     pub fn plan_import(
         &self,
         wallet: &Wallet,
@@ -57,11 +75,13 @@ impl Document {
         for account in accounts {
             let account_id = json::id(&account["id"])?;
             for item in json::array(account, "items")? {
+                reject_owned_attachments(item)?;
                 allocate(item, &account_id, &mut ids, &mut used, rng)?;
                 let key = (account_id.clone(), json::id(&item["id"])?);
                 item_ids.insert(key.clone(), ids[&key]);
             }
             for collection in json::array(account, "collections")? {
+                reject_owned_attachments(collection)?;
                 allocate_tree(collection, &account_id, &mut ids, &mut used, rng)?;
             }
         }
@@ -98,6 +118,19 @@ impl Document {
                                     &mut report,
                                 )?,
                                 "basic-auth" | "passkey" | "note" => {}
+                                "custom-fields" if credential["fields"].as_array().is_some_and(|fields| fields.iter().all(|field| {
+                                    matches!(field["fieldType"].as_str(), Some("string" | "concealed-string")) && field["value"].is_string()
+                                        || field["fieldType"] == "boolean" && matches!(field["value"].as_str(), Some("true" | "false"))
+                                })) => {}
+                                "custom-fields" => {
+                                    report.record_opaque("custom-fields");
+                                    if let Some(fields) = credential["fields"].as_array() {
+                                        for field in fields {
+                                            let kind = field["fieldType"].as_str().unwrap_or("unspecified");
+                                            *report.preserved_custom_field_types.entry(kind.to_owned()).or_default() += 1;
+                                        }
+                                    }
+                                }
                                 "totp"
                                     if matches!(
                                         credential["algorithm"].as_str(),
@@ -105,9 +138,9 @@ impl Document {
                                     ) => {}
                                 "file" => {
                                     report.external_files += 1;
-                                    report.opaque_credentials += 1;
+                                    report.record_opaque("file");
                                 }
-                                _ => report.opaque_credentials += 1,
+                                _ => report.record_opaque(credential["type"].as_str().unwrap()),
                             }
                         }
                     }
@@ -126,14 +159,58 @@ impl Document {
                 )?);
             }
         }
-        Ok(ImportPlan { entries, report })
+        Ok(ImportPlan { entries, report, reserved_ids: used })
     }
 }
 
 impl ImportPlan {
+    /// Enclose this import in a fresh root collection. Items remain independent
+    /// payloads and become direct members; existing root trees become children.
+    /// Former collection envelopes (without their now-embedded entity) remain
+    /// losslessly preserved in `source.collections` with their remapped IDs.
+    /// The existing plan is unchanged on randomness, size or depth failure.
+    /// This is opt-in: ordinary `Document::plan_import` keeps its prior layout.
+    pub fn wrap_collection(
+        &mut self,
+        title: &str,
+        rng: &mut (impl TryCryptoRng + ?Sized),
+    ) -> Result<EntryId> {
+        let mut fresh = None;
+        for _ in 0..16 {
+            let id = EntryId::generate(rng)?;
+            if !self.reserved_ids.contains(&id) { fresh = Some(id); break; }
+        }
+        let id = fresh.ok_or(kagitaba_core::Error::Randomness)?;
+        let mut entity = SecretJson(json!({"id":encoded(id),"title":title,"items":[],"subCollections":[]}));
+        let mut provenance = SecretJson(json!({"collections":[]}));
+        let mut minor = 0;
+        for payload in &self.entries {
+            if payload.kind() == PayloadKind::Item {
+                entity.0["items"].as_array_mut().unwrap().push(json!({"item":encoded(payload.entry_id())}));
+            } else {
+                let bytes = payload.to_json()?;
+                let mut envelope = json::parse(&bytes, bytes.len())?;
+                minor = minor.max(envelope.0["cxfVersion"]["minor"].as_u64().unwrap_or(0) as u8);
+                let child = envelope.0.as_object_mut().unwrap().remove("entity").unwrap();
+                entity.0["subCollections"].as_array_mut().unwrap().push(child);
+                provenance.0["collections"].as_array_mut().unwrap().push(json!({"id":encoded(payload.entry_id()),"envelope":envelope.0.take()}));
+            }
+        }
+        let wrapper = Payload::build(id, PayloadKind::Collection, entity.0.take(), provenance.0.take(), minor)?;
+        self.entries.retain(|payload| payload.kind() == PayloadKind::Item);
+        self.entries.push(wrapper);
+        self.reserved_ids.insert(id);
+        self.report.root_collections = 1;
+        Ok(id)
+    }
+
     /// Counts of imported and retained-but-unsupported data.
     pub fn report(&self) -> ImportReport {
-        self.report
+        self.report.clone()
+    }
+    /// Consume validated planned payloads for application-owned file attachment import.
+    pub fn into_entries(self) -> Vec<Payload> {
+        self.entries
     }
     /// Plaintext payloads for review. Never log their contents.
     pub fn entries(&self) -> &[Payload] {
@@ -271,6 +348,19 @@ fn rewrite_tree(
         for child in children.as_array_mut().ok_or(Error::InvalidDocument)? {
             rewrite_tree(child, account, ids, items, report)?;
         }
+    }
+    Ok(())
+}
+
+// Only this explicit application marker activates local attachment handling.
+// Preserve all other vendor fields and external file descriptors unchanged.
+fn reject_owned_attachments(entity: &Value) -> Result<()> {
+    if entity["credentials"].as_array().is_some_and(|credentials| {
+        credentials
+            .iter()
+            .any(|credential| credential.get("kagitabaFile").is_some())
+    }) {
+        return Err(Error::OwnedAttachmentsUnsupported);
     }
     Ok(())
 }

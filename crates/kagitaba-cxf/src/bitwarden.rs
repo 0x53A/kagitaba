@@ -185,6 +185,7 @@ pub fn from_json(bytes: &[u8]) -> Result<Conversion> {
     Ok(Conversion {
         document: Document::from_value(SecretJson(conversion::export(account, "Bitwarden")))?,
         report,
+        attachments: Vec::new(),
     })
 }
 

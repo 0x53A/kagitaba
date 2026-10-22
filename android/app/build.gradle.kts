@@ -23,6 +23,7 @@ android {
     packaging {
         resources.excludes += setOf("META-INF/*.SF", "META-INF/*.RSA", "META-INF/*.DSA", "META-INF/LICENSE*", "META-INF/NOTICE*", "OSGI-INF/**")
     }
+    sourceSets.getByName("androidTest").assets.srcDir("../../tests/fixtures")
     testOptions { unitTests.isReturnDefaultValues = true }
 }
 dependencies {

@@ -84,7 +84,7 @@ fn units(files: Files) -> Result<BTreeMap<String, Files>> {
         let parts: Vec<_> = path.split('/').collect();
         let unit = match parts.as_slice() {
             ["kagitaba-format"] => path.clone(),
-            ["entries" | "participants", id, ..] => format!("{}/{id}", parts[0]),
+            ["entries" | "participants" | "cache", id, ..] => format!("{}/{id}", parts[0]),
             _ => return Err(Error::Invalid),
         };
         units.entry(unit).or_default().insert(path, value);
@@ -121,6 +121,8 @@ pub(super) fn merge_files(
             l
         } else if l == b {
             r
+        } else if key.starts_with("cache/") {
+            None
         } else if key
             .strip_prefix("entries/")
             .and_then(|id| id.parse().ok())
@@ -135,7 +137,23 @@ pub(super) fn merge_files(
             merged.extend(files.clone());
         }
     }
-    if merged.len() > MAX_FILES || merged.values().map(Vec::len).sum::<usize>() > MAX_SNAPSHOT {
+    let enrolled: BTreeSet<_> = merged
+        .keys()
+        .filter_map(|path| {
+            path.strip_prefix("participants/")?
+                .strip_suffix("/pub.pem")
+                .map(str::to_owned)
+        })
+        .collect();
+    merged.retain(|path, _| {
+        !path.starts_with("cache/")
+            || path
+                .split('/')
+                .nth(1)
+                .is_some_and(|id| enrolled.contains(id))
+    });
+    if merged.len() > MAX_FILES || merged.values().map(FileData::len).sum::<usize>() > MAX_SNAPSHOT
+    {
         return Err(Error::Invalid);
     }
     let snapshot = super::snapshot_from_files(merged.clone()).map_err(|_| Error::Conflict)?;

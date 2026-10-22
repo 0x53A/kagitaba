@@ -49,6 +49,19 @@ fn android_creates_signed_native_wallet_and_preserves_unknown_encrypted_fields()
         serde_json::from_str::<Value>(&payload).unwrap()
     );
     let outsider = call(json!({"op":"identity_generate"}), 6).unwrap();
+    let catalogue_request=json!({"op":"store_catalog","path":path,"root":saved["root"],"checkpoint":saved["head"],"identity":identity["identity"]});
+    let catalogue=call(catalogue_request.clone(),21).unwrap();
+    assert_eq!(catalogue["written"],true);
+    assert_eq!(catalogue["rows"][0]["id"],id);
+    assert_eq!(catalogue["rows"][0]["usernames"],json!(["alice"]));
+    assert_eq!(catalogue["rows"][0]["password"],true);
+    assert!(!catalogue.to_string().contains("test-only"));
+    assert!(catalogue["rows"][0].get("credentials").is_none());
+    let again=call(catalogue_request,22).unwrap();
+    assert_eq!(again["written"],false);
+    assert_eq!(again["head"],catalogue["head"]);
+    assert!(call(json!({"op":"store_catalog","path":path,"root":saved["root"],"identity":identity["identity"]}),23).is_err());
+    assert!(call(json!({"op":"store_catalog","path":path,"root":saved["root"],"checkpoint":saved["head"],"identity":outsider["identity"]}),24).is_err());
     assert!(call(json!({"op":"store_delete","path":path,"root":saved["root"],"checkpoint":saved["head"],"identity":outsider["identity"],"entryId":id}), 7).is_err());
     assert_eq!(call(json!({"op":"store_open","path":path,"root":outsider["signingPem"],"checkpoint":saved["head"]}), 7).unwrap_err(), "Wallet signature is missing, invalid, or signed by an unauthorized participant. No changes were accepted.");
     assert!(call(json!({"op":"store_open","path":path}), 7).is_err());
@@ -120,4 +133,44 @@ fn android_browser_supplied_hash_is_signed_exactly_once_and_length_checked() {
         invalid["clientDataHash"] = B64.encode(vec![0; len]).into();
         assert!(call(invalid, 3).is_err());
     }
+}
+
+#[test]
+fn android_preserves_native_attachments_on_edit_refuses_reduction_and_deletes_owner_tree() {
+    use kagitaba_core::wallet::{Entry,PrimaryRecord,GrantRecord};
+    use kagitaba_store::Signer;
+    use p256::ecdsa::{SigningKey,signature::Signer as _};
+    struct NativeSigner { key: SigningKey, public: PublicKey }
+    impl Signer for NativeSigner {
+        fn public_key(&self)->&PublicKey { &self.public }
+        fn sign(&self,message:&[u8])->kagitaba_store::Result<Vec<u8>> { let signature:Signature=self.key.sign(message);Ok(signature.to_der().as_bytes().to_vec()) }
+    }
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("wallet");
+    let own=call(json!({"op":"identity_generate"}),1).unwrap();
+    let initial=call(json!({"op":"store_create","path":path,"identity":own["identity"]}),2).unwrap();
+    let signer=NativeSigner{key:SigningKey::from_slice(&B64.decode(own["identity"].as_str().unwrap()).unwrap()[36..]).unwrap(),public:PublicKey::from_pem(own["signingPem"].as_str().unwrap()).unwrap()};
+    let mut store=Store::open(&path,signer.public.clone(),Some(parse_oid(initial["head"].as_str().unwrap()).unwrap())).unwrap();
+    let id=kagitaba_core::EntryId::from_bytes([7;16]);
+    let raw=json!({"format":"kagitaba-cxf","version":1,"cxfVersion":{"major":1,"minor":0},"kind":"item","entity":{"id":B64.encode([7;16]),"title":"Attached","credentials":[]}}).to_string();
+    let payload=kagitaba_cxf::Payload::from_json(id,raw.as_bytes()).unwrap();
+    let (payload,blobs)=kagitaba_cxf::attachments::add(&payload,"file.txt",b"synthetic attachment",&mut ChaCha20Rng::from_seed([3;32])).unwrap();
+    let raw=String::from_utf8(payload.to_json().unwrap().to_vec()).unwrap();
+    let encrypted=call(json!({"op":"entry_encrypt","entryId":id.to_string(),"payload":raw,"recipients":[own["participantPem"]]}),4).unwrap();
+    let entry=Entry::from_parts(PrimaryRecord::from_bytes(&B64.decode(encrypted["primary"].as_str().unwrap()).unwrap()).unwrap(), encrypted["grants"].as_object().unwrap().values().map(|value|GrantRecord::from_bytes(&B64.decode(value.as_str().unwrap()).unwrap()).unwrap())).unwrap();
+    let mut next=store.snapshot.clone();next.wallet=next.wallet.with_entry(entry).unwrap();next.attachments.insert(id,blobs.iter().map(|(id,chunks)|(id.clone(),kagitaba_store::AttachmentBlob::from_chunks(chunks).unwrap())).collect());
+    store.save(next,&signer,"Synthetic attachment").unwrap();
+    let opened=call(json!({"op":"store_open","path":path,"root":initial["root"],"checkpoint":store.head.to_string()}),5).unwrap();
+    assert_eq!(opened["entries"][0]["hasAttachments"],true);
+    let edited=call(json!({"op":"payload_edit","entryId":id.to_string(),"payload":raw,"changes":{"title":"Edited title"}}),5).unwrap();
+    call(json!({"op":"validate_attachment_edit","entryId":id.to_string(),"payload":edited["payload"],"previousPayload":raw}),5).unwrap();
+    let encrypted=call(json!({"op":"entry_encrypt","entryId":id.to_string(),"payload":edited["payload"],"recipients":[own["participantPem"]]}),6).unwrap();
+    let mut request=json!({"op":"store_save","path":path,"root":initial["root"],"checkpoint":store.head.to_string(),"identity":own["identity"],"entryId":id.to_string(),"primary":encrypted["primary"],"grants":{}});
+    assert_eq!(call(request.clone(),7).unwrap_err(),"Attachment recipients must be changed in the native app");
+    request["grants"]=encrypted["grants"].clone();
+    let saved=call(request,7).unwrap();
+    let native=Store::open(&path,signer.public.clone(),Some(parse_oid(saved["head"].as_str().unwrap()).unwrap())).unwrap();
+    assert_eq!(native.snapshot.attachments[&id],blobs.iter().map(|(id,chunks)|(id.clone(),kagitaba_store::AttachmentBlob::from_chunks(chunks).unwrap())).collect());
+    let deleted=call(json!({"op":"store_delete","path":path,"root":initial["root"],"checkpoint":saved["head"],"identity":own["identity"],"entryId":id.to_string()}),8).unwrap();
+    let native=Store::open(&path,signer.public,Some(parse_oid(deleted["head"].as_str().unwrap()).unwrap())).unwrap();
+    assert!(native.snapshot.attachments.is_empty());
 }

@@ -142,6 +142,19 @@ async function signedMerge(replica, parents, tree, message = 'Synthetic merge') 
   return git.writeObject({...replica.opts, type:'commit', format:'content', object:new TextEncoder().encode(unsigned.replace('\n\n', '\ngpgsig '+signature.trimEnd()+'\n\n'))});
 }
 
+test('cache conflicts are discarded independently of authoritative participants', () => {
+  const base = {'kagitaba-format':'format','participants/p/pub.pem':'public','participants/p/index-key':'key','cache/p/index':'base'};
+  const left = {...base,'cache/p/index':'left'};
+  const right = {...base,'cache/p/index':'right'};
+  const without = {...base}; delete without['cache/p/index'];
+  assert.deepEqual({...mergeFiles(base,left,right)},without);
+  assert.deepEqual({...mergeFiles(base,left,base)},left);
+  assert.deepEqual({...mergeFiles(base,left,left)},left);
+  assert.deepEqual({...mergeFiles(base,left,without)},without);
+  assert.deepEqual({...mergeFiles(base,left,{'kagitaba-format':'format'})},{'kagitaba-format':'format'});
+  assert.throws(()=>mergeFiles(base,{...base,'participants/p/index-key':'new'},{...base,'participants/p/sign.pem':'sign'}),/Conflicting/);
+});
+
 test('merge policy treats entries, grants and participant metadata atomically', () => {
   const base = {'kagitaba-format':'format', 'entries/a/primary':'one', 'entries/a/grants/key':'grant'};
   const left = {...base, 'entries/b/primary':'two'}, right = {...base, 'participants/p/pub.pem':'public', 'participants/p/sign.pem':'signing'};
@@ -207,4 +220,13 @@ test('merge signer must be authorized by the second parent as well as the first'
   await r.verify(right,'ROOT',root);
   await assert.rejects(r.accept(await signedMerge(r,[left,right],tree),'ROOT',left), /Unauthorized/);
   assert.equal(r.state.head,left);
+});
+
+test('attachment blobs belong to their owner entry atomic merge unit',()=>{
+  const base={'kagitaba-format':'1','entries/a/primary':'old','entries/a/attachments/blob':'file'};
+  const left={...base,'entries/a/primary':'new'};
+  const right={...base,'entries/a/attachments/blob':'other'};
+  assert.throws(()=>mergeFiles(base,left,right),/Conflicting/);
+  assert.deepEqual({...mergeFiles(base,left,base)},left);
+  assert.deepEqual({...mergeFiles(base,{'kagitaba-format':'1'},base)},{'kagitaba-format':'1'});
 });

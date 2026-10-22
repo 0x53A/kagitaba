@@ -1,10 +1,10 @@
 //! A working tree is an encrypted, disposable view of the signed commit.
 //! Never read wallet state from it or overwrite local edits when updating it.
-use crate::{BRANCH, Error, Files, MAX_SNAPSHOT, Result, commit, read_tree};
+use crate::{BRANCH, Error, FileData, Files, MAX_SNAPSHOT, Result, commit, read_tree};
 use gix::ObjectId;
 use std::{
     fs,
-    io::Write,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -115,9 +115,7 @@ impl Update {
                         | gix::index::entry::Flags::INTENT_TO_ADD
                         | gix::index::entry::Flags::ASSUME_VALID,
                 )
-                || entry.id
-                    != gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, bytes)
-                        .map_err(|_| Error::Invalid)?
+                || entry.id != bytes.oid()?
             {
                 return Err(Error::DirtyWorktree);
             }
@@ -152,12 +150,12 @@ impl Update {
             if self.old.get(path) == Some(bytes) {
                 continue;
             }
-            check_file(root, path, self.old.get(path).map(Vec::as_slice))?;
+            check_file(root, path, self.old.get(path))?;
             let destination = root.join(path);
             let parent = destination.parent().ok_or(Error::Invalid)?;
             create_parents(root, path)?;
             let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|_| Error::Io)?;
-            file.write_all(bytes).map_err(|_| Error::Io)?;
+            std::io::copy(&mut bytes.open()?, &mut file).map_err(|_| Error::Io)?;
             file.as_file().sync_all().map_err(|_| Error::Io)?;
             file.persist(&destination).map_err(|_| Error::Io)?;
         }
@@ -191,7 +189,7 @@ fn committed_files(repo: &gix::Repository, id: ObjectId) -> Result<Files> {
     Ok(files)
 }
 
-fn check_file(root: &Path, relative: &str, expected: Option<&[u8]>) -> Result<()> {
+fn check_file(root: &Path, relative: &str, expected: Option<&FileData>) -> Result<()> {
     let mut path = root.to_owned();
     let parts: Vec<_> = relative.split('/').collect();
     for (index, part) in parts.iter().enumerate() {
@@ -207,9 +205,7 @@ fn check_file(root: &Path, relative: &str, expected: Option<&[u8]>) -> Result<()
                     }
                 }
                 let expected = expected.ok_or(Error::DirtyWorktree)?;
-                if meta.len() != expected.len() as u64
-                    || fs::read(&path).map_err(|_| Error::Io)? != expected
-                {
+                if meta.len() != expected.len() as u64 || !same_contents(&path, expected)? {
                     return Err(Error::DirtyWorktree);
                 }
             }
@@ -236,4 +232,20 @@ fn create_parents(root: &Path, relative: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn same_contents(path: &Path, expected: &FileData) -> Result<bool> {
+    let mut actual = fs::File::open(path).map_err(|_| Error::Io)?;
+    let mut expected = expected.open()?;
+    let mut a = [0u8; 65536];
+    let mut b = [0u8; 65536];
+    loop {
+        let n = actual.read(&mut a).map_err(|_| Error::Io)?;
+        if n == 0 {
+            return Ok(expected.read(&mut b[..1]).map_err(|_| Error::Io)? == 0);
+        }
+        if expected.read_exact(&mut b[..n]).is_err() || a[..n] != b[..n] {
+            return Ok(false);
+        }
+    }
 }

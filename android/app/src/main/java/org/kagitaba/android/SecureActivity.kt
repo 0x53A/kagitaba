@@ -32,6 +32,7 @@ open class SecureActivity : FragmentActivity() {
     private var backAction: (() -> Unit)? = null
     private val activeWork = mutableSetOf<kotlinx.coroutines.Job>()
     private val onLock: () -> Unit = {
+        CredentialTools.close()
         activeWork.toList().forEach { it.cancel() }
         if (!isFinishing) locked()
     }
@@ -49,14 +50,19 @@ open class SecureActivity : FragmentActivity() {
         vault = value; vault.lockListeners.add(onLock)
         vault.device.touchListeners.add(onTouch)
     }
-    override fun onDestroy() { vault.lockListeners.remove(onLock); vault.device.touchListeners.remove(onTouch); super.onDestroy() }
+    override fun onDestroy() { CredentialTools.close(); vault.lockListeners.remove(onLock); vault.device.touchListeners.remove(onTouch); super.onDestroy() }
     override fun onUserInteraction() { super.onUserInteraction(); (application as KagitabaApp).touch() }
     protected open fun locked() { screen("Wallet locked"); button("Unlock", primary = true) { authenticate { recreate() } } }
-    protected fun screen(title: String, back: (() -> Unit)? = null) {
+    protected open fun walletShown() = vault.connected
+    protected open fun closeWallet() { vault.lock(); finish() }
+    protected open fun refreshWallet() { work("Synchronizing…") { notice.text = vault.sync() } }
+    protected open fun walletSettings() {}
+    protected open fun hasWalletSettings() = false
+    protected fun screen(title: String, allowSync: Boolean = true, back: (() -> Unit)? = null) {
         backAction = back
         val spacing = (20 * resources.displayMetrics.density).toInt()
         panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(spacing, spacing, spacing, spacing) }
-        val scroll = ScrollView(this).apply { isFillViewport = true; addView(panel) }
+        val scroll = ScrollView(this).apply { isFillViewport = true; WalletTheme.persistentScrollbar(this); addView(panel) }
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(WalletTheme.background) }
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL
@@ -65,11 +71,37 @@ open class SecureActivity : FragmentActivity() {
         header.addView(TextView(this).apply {
             text = "KAGITABA"; textSize = 14f; letterSpacing = .16f; gravity = android.view.Gravity.CENTER_VERTICAL
             typeface = android.graphics.Typeface.MONOSPACE; setTextColor(WalletTheme.accent)
-        }, LinearLayout.LayoutParams(0, WalletTheme.dp(this, 56), 1f))
-        if (vault.unlocked) header.addView(Button(this).apply {
-            text = "Lock"; WalletTheme.button(this); setOnClickListener { vault.lock() }
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, WalletTheme.dp(context, 48))
-        })
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, WalletTheme.dp(this, 56)))
+        val summary = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(WalletTheme.dp(context, 8), 0, 0, 0) }
+        if (walletShown()) {
+            summary.addView(TextView(this).apply {
+                text = (application as KagitabaApp).wallets.name(vault.walletId); textSize = 12f; setTextColor(WalletTheme.ink)
+                maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+            summary.addView(TextView(this).apply {
+                text = if (vault.connected) vault.settings().optString("syncStatus", "Local") else "New wallet"
+                textSize = 10f; setTextColor(WalletTheme.muted); maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+        }
+        header.addView(summary, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        fun headerButton(text: String, description: String, allowBusy: Boolean = false, action: (Button) -> Unit) = Button(this).also {
+            it.text = text; it.contentDescription = description; WalletTheme.button(it)
+            it.gravity = android.view.Gravity.CENTER; it.setPadding(0, 0, 0, 0)
+            it.minWidth = 0; it.minimumWidth = 0
+            header.addView(it, LinearLayout.LayoutParams(WalletTheme.dp(this, 48), WalletTheme.dp(this, 48)))
+            it.setOnClickListener { _ -> if (!busy || allowBusy) action(it) }
+        }
+        if (walletShown() && hasWalletSettings() && vault.connected && vault.settings().has("url"))
+            headerButton("↻", "Synchronize") { refreshWallet() }.isEnabled = allowSync
+        headerButton("⋮", "Tools", allowBusy = true) { anchor ->
+            PopupMenu(this, anchor).apply {
+                menu.add("Password generator").apply { isEnabled = !busy }.setOnMenuItemClickListener { CredentialTools.generator(this@SecureActivity); true }
+                if (walletShown() && hasWalletSettings()) menu.add("Settings").apply { isEnabled = !busy }.setOnMenuItemClickListener { walletSettings(); true }
+                if (vault.unlocked) menu.add("Lock").setOnMenuItemClickListener { vault.lock(); true }
+                show()
+            }
+        }
+        if (walletShown()) headerButton("×", "Close wallet", allowBusy = true) { closeWallet() }.setTextColor(android.graphics.Color.rgb(255, 118, 93))
         root.addView(header)
         touchNotice = TextView(this).also {
             it.setTextColor(WalletTheme.accent); it.setTypeface(it.typeface, android.graphics.Typeface.BOLD)
@@ -85,14 +117,19 @@ open class SecureActivity : FragmentActivity() {
         }
         setContentView(root)
         if (back != null) button("← Back") { back() }
-        label(title, 27)
-        notice = label("")
+        label(title, 27).also { WalletTheme.heading(it, 27f); it.setPadding(0, WalletTheme.dp(this, 12), 0, WalletTheme.dp(this, 20)) }
+        notice = label("", 14)
         notice.setTextColor(WalletTheme.accent)
         notice.accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
     }
     protected fun label(text: String, size: Int = 16): TextView = TextView(this).also {
+        it.typeface = if (size < 16 || size >= 19) android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.NORMAL) else WalletTheme.dataFont(this)
         it.text = text; it.textSize = size.toFloat(); it.setTextColor(if (size < 16) WalletTheme.muted else WalletTheme.ink)
         it.setPadding(0, WalletTheme.dp(this, 8), 0, WalletTheme.dp(this, 8)); panel.addView(it)
+    }
+    protected fun group(title: String) {
+        panel.addView(View(this).apply { setBackgroundColor(WalletTheme.line) }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, WalletTheme.dp(this, 1)).apply { topMargin = WalletTheme.dp(this@SecureActivity, 24); bottomMargin = WalletTheme.dp(this@SecureActivity, 8) })
+        label(title, 19).also { WalletTheme.heading(it) }
     }
     protected fun field(title: String, value: String = "", secret: Boolean = false): EditText {
         val heading = label(title, 14)
@@ -130,13 +167,14 @@ open class SecureActivity : FragmentActivity() {
             }, { notice.text = it })
         }
     }
-    protected suspend fun autoSync(): String? {
+    protected suspend fun autoSync(afterSave: Boolean = true): String? {
         if (vault.settings().optBoolean("autoSync") && vault.settings().has("url")) {
-            notice.text = "Saved on this device. Synchronizing…"
+            val prefix = if (afterSave) "Saved on this device. " else ""
+            notice.text = "${prefix}Synchronizing…"
             val result = try { vault.sync() } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 runCatching { vault.recordSyncFailure() }
-                "Saved on this device. ${friendlyError(e)}"
+                "${prefix}${friendlyError(e)}"
             }
             notice.text = result
             return result
@@ -149,7 +187,7 @@ open class SecureActivity : FragmentActivity() {
         else -> {
             val message = e.message.orEmpty()
             // Only fixed application-owned messages; never expose native/Git/HTTP input.
-            val safe = setOf("Wallet validation or storage failed", "Unlock your wallet first", "Remote wallet branch is missing",
+            val safe = setOf(DeviceToken.ERROR, "Wallet validation or storage failed", "Unlock your wallet first", "Remote wallet branch is missing",
                 "Wallet histories diverged. No changes were discarded; resolve this on your computer.", "Only ES256 passkeys are supported",
                 "This passkey extension is not supported yet", "This passkey already exists", "This app is not associated with the passkey website",
                 "Use an HTTPS Git URL without embedded credentials", "An HTTPS website is required", "Invalid or unsupported cryptographic operation",

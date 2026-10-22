@@ -1,5 +1,7 @@
 // Only single, explicitly approved credentials cross this isolated bridge.
+import {passkeyChooser} from './passkey-chooser.mjs';
 const documentToken = crypto.randomUUID();
+const chooser = passkeyChooser(documentToken);
 window.addEventListener('message', async event => {
   if (event.source !== window || event.origin !== location.origin || typeof event.data?.id !== 'string' || event.data.id.length > 80) return;
   if (event.data.channel === 'kagitaba-cancel') {
@@ -15,6 +17,7 @@ window.addEventListener('message', async event => {
 browser.runtime.onMessage.addListener(message => {
   if (message.type === 'probe') return Promise.resolve({documentToken, origin: location.origin});
   if (message.documentToken !== documentToken || message.origin !== location.origin) throw new Error('The document changed');
+  if (['passkey-chooser', 'passkey-dismiss'].includes(message.type)) {chooser(message); return Promise.resolve(true);}
   if (message.type === 'fill') {
     const passwords = [...document.querySelectorAll('input[type=password]')].filter(el => !el.disabled && el.getClientRects().length);
     if (!passwords.length) throw new Error('No visible password field');

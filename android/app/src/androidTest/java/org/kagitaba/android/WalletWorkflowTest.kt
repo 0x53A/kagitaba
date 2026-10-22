@@ -17,6 +17,29 @@ import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class WalletWorkflowTest {
+    @Test fun enrollmentSessionDoesNotChangeSavedWalletCatalogOrSelection() {
+        assumeTrue("Session test is for disposable emulators only", android.os.Build.MODEL.contains("sdk"))
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val app = instrumentation.targetContext.applicationContext as KagitabaApp
+        val catalog = File(app.noBackupFilesDir, "wallets.json")
+        val before = catalog.takeIf { it.exists() }?.readBytes()
+        val selected = app.wallets.selected()
+        val original = app.vault.walletId
+        instrumentation.runOnMainSync {
+            try {
+                repeat(2) {
+                    app.beginEnrollment()
+                    assertEquals("", app.vault.walletId)
+                    assertFalse(app.vault.connected)
+                    assertEquals(selected, app.wallets.selected())
+                    app.endEnrollment()
+                    assertEquals(original, app.vault.walletId)
+                }
+            } finally { app.endEnrollment() }
+        }
+        assertArrayEquals(before, catalog.takeIf { it.exists() }?.readBytes())
+    }
+
     @Test fun clonedWalletsExposeVerifiedParticipantsBeforeUnlockAndKeepSeparateTrust(): Unit = runBlocking {
         val app = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as KagitabaApp
         val fixture = File(app.cacheDir, "wallet-workflows-${System.nanoTime()}").apply { mkdirs() }

@@ -83,7 +83,7 @@ impl Drop for Secret {
         clear(&mut self.0);
     }
 }
-struct Identity {
+pub(super) struct Identity {
     signing: SigningKey,
     public: PublicKey,
     agreement: PublicKey,
@@ -98,7 +98,7 @@ impl Signer for SignerRef<'_> {
     }
 }
 impl Identity {
-    fn read(v: &Value) -> Result<Self> {
+    pub(super) fn read(v: &Value) -> Result<Self> {
         let bytes = Zeroizing::new(B64.decode(text(v, "identity")?).map_err(error)?);
         if bytes.len() != 68 || &bytes[..4] != b"KBI1" {
             return Err("Invalid identity");
@@ -253,10 +253,15 @@ pub(super) fn execute_with(
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let entry = Entry::from_parts(primary, grants).map_err(error)?;
+                if store.snapshot.attachments.contains_key(&id)
+                    && store.snapshot.wallet.entries().get(&id).is_some_and(|old|
+                        old.grants().keys().any(|recipient| !entry.grants().contains_key(recipient)))
+                { return Err("Attachment recipients must be changed in the native app"); }
                 store.snapshot.wallet.with_entry(entry).map_err(error)?
             };
             let mut next = store.snapshot.clone();
             next.wallet = wallet;
+            if op == "store_delete" { next.attachments.remove(&id); }
             next.prune_legacy(&mut rng).map_err(store_error)?;
             store
                 .save(
@@ -274,7 +279,8 @@ pub(super) fn execute_with(
     }
     let entries: Vec<_> = store.snapshot.wallet.entries().iter().map(|(id, entry)| {
         let grants: serde_json::Map<String, Value> = entry.grants().iter().map(|(id, grant)| (id.to_string(), json!(B64.encode(grant.to_bytes())))).collect();
-        json!({"id": id.to_string(), "primary": B64.encode(entry.primary().to_bytes()), "grants": grants})
+        json!({"id": id.to_string(), "primary": B64.encode(entry.primary().to_bytes()), "grants": grants,
+            "hasAttachments": store.snapshot.attachments.contains_key(id)})
     }).collect();
     let participants: serde_json::Map<String, Value> = store
         .snapshot

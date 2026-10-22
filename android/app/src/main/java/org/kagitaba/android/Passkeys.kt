@@ -13,7 +13,7 @@ class Passkeys(private val policy: CallerPolicy) {
         val allowed = descriptorIds(options.optJSONArray("allowCredentials"))
         return items.flatMap { item -> item.credentials("passkey").filter {
             it.optString("rpId") == rp && (allowed.isEmpty() || it.optString("credentialId") in allowed) &&
-                runCatching { NativeBridge.call("passkey_validate", json("privateKey" to it.getString("key"))); true }.getOrDefault(false)
+                runCatching { NativeBridge.call("passkey_validate", withBackupFlags(json("privateKey" to it.getString("key")), it)); true }.getOrDefault(false)
         }.map { Account(item, it) } }
     }
     private fun clientData(options: JSONObject, origin: String, type: String): String {
@@ -56,6 +56,7 @@ class Passkeys(private val policy: CallerPolicy) {
         require(matches(listOf(selected.item), options).any { it.credential.getString("credentialId") == selected.credential.getString("credentialId") }) { "Selected passkey does not match the request" }
         val data = clientData(options, origin, "webauthn.get")
         val args = json("rpId" to rp, "privateKey" to selected.credential.getString("key"), "clientDataJSON" to data, "uv" to true)
+        withBackupFlags(args, selected.credential)
         if (clientHash != null) {
             require(origin.startsWith("https://") && clientHash.size == 32) { "Invalid browser client data" }
             args.put("clientDataHash", b64(clientHash))
@@ -71,6 +72,12 @@ class Passkeys(private val policy: CallerPolicy) {
         return json("id" to id, "rawId" to id, "type" to "public-key", "authenticatorAttachment" to "platform", "response" to response, "clientExtensionResults" to extensionResults).toString()
     }
     companion object {
+        // Website data must never override encrypted credential backup state.
+        fun withBackupFlags(args: JSONObject, credential: JSONObject): JSONObject {
+            args.remove("kagitabaBackupFlags")
+            if (credential.has("kagitabaBackupFlags")) args.put("kagitabaBackupFlags", credential.get("kagitabaBackupFlags"))
+            return args
+        }
         fun descriptorIds(list: JSONArray?): Set<String> {
             require(list == null || list.length() <= 256) { "Too many credential descriptors" }
             if (list == null) return emptySet()

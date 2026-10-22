@@ -155,6 +155,53 @@ pub trait Transport: Send {
 pub struct Piv<T: Transport> {
     transport: T,
 }
+/// A card whose PIN was explicitly verified, retained while the caller selects
+/// existing slots or authorizes generation. No PIN is retained or retried.
+pub struct AuthenticatedPiv<T: Transport> {
+    card: Piv<T>,
+}
+impl<T: Transport> AuthenticatedPiv<T> {
+    pub fn new(mut card: Piv<T>, pin: &str) -> Result<Self> {
+        card.verify_pin(pin)?;
+        Ok(Self { card })
+    }
+    pub fn p256_slots(&mut self) -> Result<Vec<u8>> {
+        let mut slots = Vec::new();
+        for slot in 0x82..=0x95 {
+            match self.card.public_key(slot) {
+                Ok(_) => slots.push(slot),
+                Err(Error::Status(0x6a88) | Error::Unsupported) => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(slots)
+    }
+    pub fn use_slots(mut self, slots: Slots) -> Result<Session<T>> {
+        let encryption = self.card.key_metadata(slots.encryption())?;
+        let signing = self.card.key_metadata(slots.signing())?;
+        Ok(Session { card: Mutex::new(self.card), slots,
+            encryption: encryption.public_key, signing: signing.public_key,
+            encryption_policy: encryption.policy, signing_policy: signing.policy, observer: None })
+    }
+    pub fn provision(self, slots: Slots, management_key: &[u8]) -> Result<Session<T>> {
+        self.provision_with_policies(slots, management_key, Policies::default())
+    }
+    pub fn provision_with_policies(mut self, slots: Slots, management_key: &[u8], policies: Policies) -> Result<Session<T>> {
+        // Read raw metadata, not only supported keys: any occupied or unreadable
+        // slot must prevent BOTH writes, including an unsupported algorithm.
+        for slot in [slots.encryption(), slots.signing()] {
+            match self.card.command(0xf7, 0, slot, &[]) {
+                Err(Error::Status(0x6a88)) => {},
+                Ok(_) => return Err(Error::Occupied),
+                Err(error) => return Err(error),
+            }
+        }
+        self.card.authenticate_management(management_key)?;
+        self.card.generate_empty_with_policy(slots.encryption(), policies.encryption)?;
+        self.card.generate_empty_with_policy(slots.signing(), policies.signing)?;
+        self.use_slots(slots)
+    }
+}
 impl<T: Transport> Piv<T> {
     pub fn new(transport: T) -> Result<Self> {
         let mut card = Self { transport };
@@ -372,6 +419,11 @@ impl<T: Transport> Session<T> {
             signing_policy: signing.policy,
             observer: None,
         })
+    }
+    /// One explicit PIN verification on the selected card, even in an unlocked session.
+    /// Callers own prompts and retry policy; errors are never retried here.
+    pub fn verify_pin(&self, pin: &str) -> Result<()> {
+        self.card.lock().map_err(|_| Error::Usb)?.verify_pin(pin)
     }
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
         let mut card = self.card.lock().map_err(|_| Error::Usb)?;

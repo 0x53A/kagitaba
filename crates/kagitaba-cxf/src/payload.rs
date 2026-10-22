@@ -103,6 +103,14 @@ impl Payload {
     pub fn entry_id(&self) -> EntryId {
         self.entry
     }
+    /// Allocate a different outer identity without discarding envelope fields.
+    /// Callers must separately rewrite local references and re-encrypt owned
+    /// attachments, whose ciphertext contexts bind the previous owner ID.
+    pub fn with_entry_id(&self, entry: EntryId) -> Result<Self> {
+        let mut raw = SecretJson(self.raw.0.clone());
+        raw.0["entity"]["id"] = data_encoding::BASE64URL_NOPAD.encode(entry.as_bytes()).into();
+        Self::from_json(entry, &json::encode(&raw.0)?)
+    }
     /// Whether this entry contains an item or an entire collection tree.
     pub fn kind(&self) -> PayloadKind {
         self.kind

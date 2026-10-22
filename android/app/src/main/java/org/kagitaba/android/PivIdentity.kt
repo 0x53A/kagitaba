@@ -76,13 +76,18 @@ class PivIdentity(private val context: Context) {
                      onSuccess: (ByteArray) -> Unit, onError: (String) -> Unit) {
         close()
         val layout = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL; val pad = WalletTheme.dp(activity, 20); setPadding(pad, pad, pad, pad); setBackgroundColor(WalletTheme.surface) }
-        fun label(value: String) = TextView(activity).also { it.text = value; it.setTextColor(WalletTheme.ink); layout.addView(it) }
-        label(if (candidates != null) "Connect your YubiKey. Its public keys will be matched to the verified wallet before asking for its PIN."
-            else if (provision) "Choose two empty slots after connecting your key. Generating keys requires your existing PIV PIN and management key."
-            else "Choose an existing P-256 slot pair after connecting your YubiKey.")
-        val status = label("Plug in the key or hold it against the NFC reader, then press Detect YubiKey.")
+        fun label(value: String) = TextView(activity).also { it.text = value; WalletTheme.caption(it); layout.addView(it) }
+        val status = label("Connect a YubiKey over USB or NFC.")
+        layout.removeView(status)
+        val keyRow = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL; layout.addView(this) }
+        keyRow.addView(status, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        val refresh = Button(activity).apply {
+            text = "↻"; contentDescription = "Refresh YubiKey"; WalletTheme.button(this)
+            keyRow.addView(this, LinearLayout.LayoutParams(WalletTheme.dp(activity, 48), WalletTheme.dp(activity, 48)))
+        }
+        var generate = provision
         val options = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE; layout.addView(this) }
-        fun optionLabel(text: String) { options.addView(TextView(activity).apply { this.text = text; if (text == "YubiKey PIV PIN") setTypeface(typeface, android.graphics.Typeface.BOLD); setTextColor(WalletTheme.muted); setPadding(0, WalletTheme.dp(activity, 12), 0, WalletTheme.dp(activity, 8)) }) }
+        fun optionLabel(text: String) { options.addView(TextView(activity).apply { this.text = text; WalletTheme.caption(this); if (text == "YubiKey PIV PIN") setTypeface(typeface, android.graphics.Typeface.BOLD); setPadding(0, WalletTheme.dp(activity, 12), 0, WalletTheme.dp(activity, 8)) }) }
         fun field(title: String): EditText {
             optionLabel(title)
             return EditText(activity).also { it.isSingleLine = true; it.isSaveEnabled = false
@@ -93,44 +98,80 @@ class PivIdentity(private val context: Context) {
         val participants = if (candidates != null) chooser("Wallet participant") else null
         val encSlots = if (candidates == null) chooser("Encryption slot") else null
         val sigSlots = if (candidates == null) chooser("Signing slot") else null
+        val policyViews = mutableListOf<View>()
         fun policyPicker(title: String, values: List<String>, selected: Int): Spinner = chooser(title).apply {
+            policyViews.add(options.getChildAt(options.childCount - 2)); policyViews.add(this)
             adapter = ArrayAdapter(activity, android.R.layout.simple_spinner_dropdown_item, values); setSelection(selected)
         }
-        val encPin = if (provision) policyPicker("Encryption PIN policy", listOf("Once per session (default)", "Never — no hardware PIN requirement"), 0) else null
-        val encTouch = if (provision) policyPicker("Encryption touch policy", listOf("Never", "Always", "Cached (default)"), 2) else null
-        val sigPin = if (provision) policyPicker("Signing PIN policy", listOf("Once per session (default)", "Never — no hardware PIN requirement"), 0) else null
-        val sigTouch = if (provision) policyPicker("Signing touch policy", listOf("Never", "Always (default)", "Cached"), 1) else null
-        if (provision) optionLabel("Policies are fixed at key creation. Cached touch lasts briefly. PIN Always needs per-operation PIN prompts, which are not supported. Kagitaba still asks for a PIV PIN when PIN Never is selected.")
+        val encPin = if (candidates == null) policyPicker("Encryption PIN policy", listOf("Once per session (default)", "Never — no hardware PIN requirement"), 0) else null
+        val encTouch = if (candidates == null) policyPicker("Encryption touch policy", listOf("Never", "Always", "Cached (default)"), 2) else null
+        val sigPin = if (candidates == null) policyPicker("Signing PIN policy", listOf("Once per session (default)", "Never — no hardware PIN requirement"), 0) else null
+        val sigTouch = if (candidates == null) policyPicker("Signing touch policy", listOf("Never", "Always (default)", "Cached"), 1) else null
+        if (candidates == null) { optionLabel("Policies are fixed at key creation. Cached touch lasts briefly. PIN Always needs per-operation PIN prompts, which are not supported. Kagitaba still asks for a PIV PIN when PIN Never is selected."); policyViews.add(options.getChildAt(options.childCount - 1)) }
         val currentPolicies = TextView(activity).also { it.setTextColor(WalletTheme.ink); options.addView(it) }
         var slotPolicies = JSONObject()
         var matches = emptyList<JSONObject>()
         var slots = emptyList<Int>()
         fun showPolicies() {
-            if (provision) return
+            currentPolicies.visibility = if (generate) View.GONE else View.VISIBLE
+            if (generate) return
             val selected = if (candidates != null) matches.getOrNull(participants!!.selectedItemPosition) else null
             val encryption = selected?.optJSONObject("encryptionPolicy") ?: slots.getOrNull(encSlots?.selectedItemPosition ?: -1)?.let { slotPolicies.optJSONObject(it.toString()) }
             val signing = selected?.optJSONObject("signingPolicy") ?: slots.getOrNull(sigSlots?.selectedItemPosition ?: -1)?.let { slotPolicies.optJSONObject(it.toString()) }
             currentPolicies.text = "Current device policies (read-only)\n" + policyDescription("Encryption", encryption) + "\n" + policyDescription("Signing", signing)
         }
         val pin = field("YubiKey PIV PIN")
-        val management = if (provision) field("Management key (hex)") else null
-        if (provision) options.addView(Button(activity).apply { text = "Use factory management key"; isAllCaps = false
-            setOnClickListener { management!!.setText("010203040506070801020304050607080102030405060708") } })
-        val consent = if (provision) CheckBox(activity).also { it.text = "Generate keys in the two selected empty slots. This changes the YubiKey; existing keys will not be overwritten."; options.addView(it) } else null
-        for (spinner in listOfNotNull(participants, encSlots, sigSlots, encPin, encTouch, sigPin, sigTouch)) {
-            spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { consent?.isChecked = false; showPolicies() }
-                override fun onNothingSelected(parent: AdapterView<*>?) { showPolicies() }
-            }
-        }
+        val slotMode = if (candidates == null) RadioGroup(activity).also { options.addView(it, 0) } else null
+        val existingMode = slotMode?.let { RadioButton(activity).apply { id = View.generateViewId(); text = "Use existing slots"; it.addView(this) } }
+        val newMode = slotMode?.let { RadioButton(activity).apply { id = View.generateViewId(); text = "Enroll new slots"; it.addView(this) } }
+        val managementHeading = if (candidates == null) TextView(activity).also { it.text = "Management key"; WalletTheme.caption(it); options.addView(it) } else null
+        val management = if (candidates == null) EditText(activity).also {
+            it.isSingleLine = true; it.isSaveEnabled = false; it.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            it.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD; WalletTheme.field(it); options.addView(it)
+        } else null
+        val factory = if (candidates == null) Button(activity).also {
+            it.text = "Default"; WalletTheme.button(it); options.addView(it)
+            it.setOnClickListener { management!!.setText("010203040506070801020304050607080102030405060708") }
+        } else null
+        val consent = if (candidates == null) CheckBox(activity).also { it.text = "Create keys in the selected empty slots"; it.setTextColor(WalletTheme.ink); options.addView(it) } else null
+        var occupiedSlots = emptyList<Int>()
+        var emptySlots = emptyList<Int>()
         var serial = ""
         var finished = false
         var attempting = false
         var discovery: YubiKitManager? = null
         var detectedDevice: YubiKeyDevice? = null
         var pending: PivConnection? = null
-        val dialog = AlertDialog.Builder(activity).setTitle(if (provision) "Create PIV participant" else "Use YubiKey")
-            .setView(ScrollView(activity).apply { addView(layout) }).setPositiveButton("Detect YubiKey", null).setNegativeButton("Cancel", null).create()
+        val dialog = AlertDialog.Builder(activity).setTitle(if (candidates == null) "Choose PIV key" else "Unlock wallet")
+            .setView(ScrollView(activity).apply { WalletTheme.persistentScrollbar(this); addView(layout) }).setPositiveButton("Detect YubiKey", null).setNegativeButton("Cancel", null).create()
+        fun updateSlots() {
+            if (candidates != null) return
+            slots = if (generate) emptySlots else occupiedSlots
+            for ((spinner, default) in listOf(encSlots!! to 0x82, sigSlots!! to 0x83)) {
+                spinner.adapter = ArrayAdapter(activity, android.R.layout.simple_spinner_dropdown_item, slots.map { "${it.toString(16).uppercase()}${if (it == default) " default" else ""}" })
+                spinner.setSelection(slots.indexOf(default).takeIf { it >= 0 } ?: if (default == 0x83 && slots.size > 1) 1 else 0)
+            }
+            for (view in listOfNotNull(managementHeading, management, factory, consent)) view.visibility = if (generate) View.VISIBLE else View.GONE
+            for (view in policyViews) view.visibility = if (generate) View.VISIBLE else View.GONE
+            showPolicies()
+            management?.text?.clear(); consent?.isChecked = false
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.text = if (generate) "Create keys" else "Unlock"
+        }
+        slotMode?.setOnCheckedChangeListener { _, selected -> generate = selected == newMode!!.id; updateSlots() }
+        val slotSelection = object : AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: AdapterView<*>?) { showPolicies() }
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                consent?.isChecked = false
+                showPolicies()
+                val encryption = slots.getOrNull(encSlots?.selectedItemPosition ?: -1)
+                val signing = slots.getOrNull(sigSlots?.selectedItemPosition ?: -1)
+                if (encryption != null && signing != null)
+                    consent?.text = "Yes, create keys in ${encryption.toString(16).uppercase()} and ${signing.toString(16).uppercase()}"
+            }
+        }
+        encSlots?.onItemSelectedListener = slotSelection
+        sigSlots?.onItemSelectedListener = slotSelection
+        for (spinner in listOfNotNull(participants, encPin, encTouch, sigPin, sigTouch)) spinner.onItemSelectedListener = slotSelection
         val onLock: () -> Unit = { dialog.dismiss() }
         owner.lockListeners.add(onLock)
         fun stopNfc() { runCatching { discovery?.stopNfcDiscovery(activity) } }
@@ -154,7 +195,7 @@ class PivIdentity(private val context: Context) {
         fun detected(device: YubiKeyDevice) { activity.runOnUiThread {
             if (finished || attempting || pending != null || !dialog.isShowing) return@runOnUiThread
             if (!activity.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) { reset("Return to Kagitaba and press Detect YubiKey."); return@runOnUiThread }
-            attempting = true; status.text = "Reading public PIV metadata… No PIN is being sent."
+            attempting = true; status.text = "Reading PIV slots…"
             activity.lifecycleScope.launch {
                 var opened: PivConnection? = null
                 try {
@@ -172,17 +213,20 @@ class PivIdentity(private val context: Context) {
                     } else {
                         slotPolicies = result.optJSONObject("policies") ?: JSONObject()
                         serial = result.getString("serial")
-                        val values = result.getJSONArray(if (provision) "emptySlots" else "occupiedSlots")
-                        slots = (0 until values.length()).map { values.getInt(it) }
-                        check(slots.size >= 2) { if (provision) "This YubiKey has fewer than two empty PIV slots." else "This YubiKey has fewer than two existing P-256 PIV slots." }
-                        for (spinner in listOf(encSlots!!, sigSlots!!)) spinner.adapter = ArrayAdapter(activity, android.R.layout.simple_spinner_dropdown_item, slots.map { it.toString(16).uppercase() })
-                        sigSlots.setSelection(1)
+                        occupiedSlots = result.getJSONArray("occupiedSlots").let { values -> (0 until values.length()).map { values.getInt(it) } }
+                        emptySlots = result.getJSONArray("emptySlots").let { values -> (0 until values.length()).map { values.getInt(it) } }
+                        check(occupiedSlots.size >= 2 || emptySlots.size >= 2) { "This YubiKey has fewer than two empty PIV slots." }
+                        existingMode!!.isEnabled = occupiedSlots.size >= 2
+                        newMode!!.isEnabled = emptySlots.size >= 2
+                        generate = occupiedSlots.size < 2 || generate && emptySlots.size >= 2
+                        slotMode!!.check(if (generate) newMode.id else existingMode.id)
+                        updateSlots()
                     }
                     pending = opened; opened = null; detectedDevice = device
                     showPolicies()
                     attempting = false; options.visibility = View.VISIBLE
-                    status.text = if (candidates != null) "Matched ${matches.size} participant(s). Keep the key connected and enter its PIV PIN." else "YubiKey $serial. Select the slot pair and enter its PIV PIN."
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).apply { text = if (provision) "Generate keys" else "Unlock"; isEnabled = true }
+                    status.text = if (candidates != null) "${matches.size} matching participant(s)" else "YubiKey $serial"
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).apply { text = if (generate) "Create keys" else "Unlock"; isEnabled = true }
                 } catch (e: Exception) {
                     release(opened)
                     if (e is kotlinx.coroutines.CancellationException) throw e
@@ -196,6 +240,9 @@ class PivIdentity(private val context: Context) {
         }
         activity.lifecycle.addObserver(observer)
         dialog.show(); dialog.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        refresh.setOnClickListener {
+            if (!attempting) { reset("Detecting YubiKey…"); dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick() }
+        }
         dialog.window?.decorView?.filterTouchesWhenObscured = true
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
             if (attempting) return@setOnClickListener
@@ -215,7 +262,7 @@ class PivIdentity(private val context: Context) {
             val request = if (candidates != null) JSONObject(matches[participants!!.selectedItemPosition].toString())
                 else json("encryptionSlot" to slots[encSlots!!.selectedItemPosition], "signingSlot" to slots[sigSlots!!.selectedItemPosition], "serial" to serial)
             if (request.getInt("encryptionSlot") == request.getInt("signingSlot")) { status.text = "Choose two different slots."; return@setOnClickListener }
-            if (provision) {
+            if (generate) {
                 if (consent?.isChecked != true) { status.text = "Confirm generation in the selected empty PIV slots."; return@setOnClickListener }
                 request.put("op", "provision").put("confirmed", true).put("managementKey", management!!.text.toString().trim())
                 request.put("encryptionPolicy", json("pin" to if (encPin!!.selectedItemPosition == 0) 2 else 1, "touch" to encTouch!!.selectedItemPosition + 1))
@@ -223,7 +270,7 @@ class PivIdentity(private val context: Context) {
             }
             request.put("pin", enteredPin); pin.text.clear(); management?.text?.clear()
             attempting = true; dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
-            status.text = if (provision) "Generating keys. Keep the YubiKey connected and touch it when requested…" else "Unlocking. Touch the YubiKey if requested…"
+            status.text = if (generate) "Generating keys. Keep the YubiKey connected and touch it when requested…" else "Unlocking. Touch the YubiKey if requested…"
             activity.lifecycleScope.launch {
                 var result: JSONObject? = null
                 try {
@@ -247,6 +294,7 @@ class PivIdentity(private val context: Context) {
 
 object PivErrors {
     private val messages = setOf(
+        "Sync token belongs to another key. Unlock with that key or enter a Git token in Connection settings.",
         "PIV operation failed. Reconnect your YubiKey and unlock again.",
         "Unsupported PIV policy selection.",
         "PIV PIN is blocked. Use your recovery procedure on your computer.",

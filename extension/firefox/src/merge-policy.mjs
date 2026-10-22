@@ -34,7 +34,7 @@ function units(files) {
     const parts = path.split('/');
     let unit;
     if (path === 'kagitaba-format') unit = path;
-    else if (parts.length >= 3 && ['entries', 'participants'].includes(parts[0])) unit = parts.slice(0, 2).join('/');
+    else if (parts.length >= 3 && ['entries', 'participants', 'cache'].includes(parts[0])) unit = parts.slice(0, 2).join('/');
     else throw Error('Unsupported wallet history');
     if (!groups.has(unit)) groups.set(unit, Object.create(null));
     groups.get(unit)[path] = bytes;
@@ -51,9 +51,13 @@ export function mergeFiles(baseFiles, leftFiles, rightFiles) {
     let chosen;
     if (equalFiles(l, r) || equalFiles(r, b)) chosen = l;
     else if (equalFiles(l, b)) chosen = r;
+    else if (key.startsWith('cache/')) continue;
     else if (key.startsWith('entries/') && metadata.has(key.slice(8))) chosen = mergeMetadataGrants(b,l,r);
     else throw Error('Conflicting wallet changes');
     if (chosen) Object.assign(merged, chosen);
+  }
+  for (const path of Object.keys(merged)) {
+    if (path.startsWith('cache/') && !merged[`participants/${path.split('/')[1]}/pub.pem`]) delete merged[path];
   }
   const referenced = new Set(Object.values(metadataPointers(merged)));
   for (const id of metadata) if (merged[`entries/${id}/primary`] && !referenced.has(id)) throw Error('Conflicting wallet changes');

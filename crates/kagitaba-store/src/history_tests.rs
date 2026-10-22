@@ -162,6 +162,9 @@ fn new_metadata_and_enrollment_merge_then_add_grants_in_a_separate_commit() {
     }
     assert!(files(&left.snapshot).unwrap().values().all(|bytes| {
         !bytes
+            .clone()
+            .into_bytes()
+            .unwrap()
             .windows(b"Private name".len())
             .any(|w| w == b"Private name")
     }));
@@ -681,4 +684,308 @@ fn dirty_worktree_stale_store_and_signing_failure_leave_heads_unchanged() {
         std::fs::read(left.path.join("kagitaba-format")).unwrap(),
         b"dirty"
     );
+}
+
+#[test]
+fn participant_cache_conflicts_are_dropped_but_keys_are_authoritative() {
+    for (left_value, right_value, expected) in [
+        (Some(2), Some(3), None),
+        (None, Some(3), None),
+        (Some(2), Some(2), Some(2)),
+        (Some(1), Some(3), Some(3)),
+    ] {
+        let (_dir, key, mut left, mut right) = pair();
+        let participant = encryption(8);
+        let id = participant.id();
+        let mut next = left.snapshot.clone();
+        next.provision_index_key(
+            &participant,
+            &mut rand_chacha::ChaCha20Rng::from_seed([23; 32]),
+        )
+        .unwrap();
+        next.indexes.insert(id, vec![1]);
+        left.save(next, &key, "Provision index").unwrap();
+        right.pull_from(&left.path).unwrap();
+        let wrapper = left.snapshot.index_keys[&id].clone();
+        for (store, value) in [(&mut left, left_value), (&mut right, right_value)] {
+            let mut next = store.snapshot.clone();
+            match value {
+                Some(value) => {
+                    next.indexes.insert(id, vec![value]);
+                }
+                None => {
+                    next.indexes.remove(&id);
+                }
+            }
+            store.save(next, &key, "Refresh index").unwrap();
+        }
+        left.merge_from(&right.path, &key).unwrap();
+        assert_eq!(
+            left.snapshot.indexes.get(&id),
+            expected.map(|v| vec![v]).as_ref()
+        );
+        assert_eq!(left.snapshot.index_keys[&id], wrapper);
+        let opened = Store::open(&left.path, key.public.clone(), Some(right.head)).unwrap();
+        assert_eq!(opened.snapshot.indexes, left.snapshot.indexes);
+    }
+}
+
+#[test]
+fn removed_participant_cache_is_pruned_even_if_other_branch_refreshes_it() {
+    let (_dir, key, mut left, mut right) = pair();
+    let participant = encryption(9);
+    let id = participant.id();
+    let mut next = left.snapshot.clone();
+    next.provision_index_key(
+        &participant,
+        &mut rand_chacha::ChaCha20Rng::from_seed([24; 32]),
+    )
+    .unwrap();
+    next.indexes.insert(id, vec![1]);
+    left.save(next, &key, "Provision index").unwrap();
+    right.pull_from(&left.path).unwrap();
+    let mut next = left.snapshot.clone();
+    next.wallet = Wallet::from_parts(
+        next.wallet
+            .participants()
+            .values()
+            .filter(|p| p.id() != id)
+            .cloned(),
+        next.wallet.entries().values().cloned(),
+    )
+    .unwrap();
+    next.signers.remove(&id);
+    next.index_keys.remove(&id);
+    next.indexes.remove(&id);
+    left.save(next, &key, "Remove participant").unwrap();
+    let mut next = right.snapshot.clone();
+    next.indexes.insert(id, vec![2]);
+    right.save(next, &key, "Refresh departed index").unwrap();
+    left.merge_from(&right.path, &key).unwrap();
+    assert!(!left.snapshot.indexes.contains_key(&id));
+    assert!(!left.snapshot.index_keys.contains_key(&id));
+}
+
+#[test]
+fn independently_provisioned_index_keys_conflict_as_authoritative_metadata() {
+    let (_dir, key, mut left, mut right) = pair();
+    for (store, seed) in [(&mut left, 25), (&mut right, 26)] {
+        let mut next = store.snapshot.clone();
+        next.provision_index_key(
+            &encryption(8),
+            &mut rand_chacha::ChaCha20Rng::from_seed([seed; 32]),
+        )
+        .unwrap();
+        store.save(next, &key, "Provision index key").unwrap();
+    }
+    let before = left.head;
+    assert!(matches!(
+        left.merge_from(&right.path, &key),
+        Err(Error::Conflict)
+    ));
+    assert_eq!(left.head, before);
+}
+
+#[test]
+fn index_paths_require_enrolled_keys_but_disposable_ciphertext_can_be_rebuilt() {
+    let public = encryption(8);
+    let id = public.id();
+    let mut snapshot = Snapshot::empty(public.clone(), Key::new(3).public).unwrap();
+    snapshot.indexes.insert(id, vec![0]);
+    assert!(snapshot.validate().is_err());
+    snapshot
+        .provision_index_key(&public, &mut rand_chacha::ChaCha20Rng::from_seed([27; 32]))
+        .unwrap();
+    snapshot.validate().unwrap();
+    let parsed = snapshot_from_files(files(&snapshot).unwrap()).unwrap();
+    assert_eq!(parsed.indexes[&id], vec![0]);
+    snapshot
+        .indexes
+        .insert(id, vec![0; index::MAX_INDEX_BYTES + 1]);
+    assert!(snapshot.validate().is_err());
+    snapshot.indexes.clear();
+    let mut wrong = snapshot.index_keys.remove(&id).unwrap();
+    snapshot
+        .index_keys
+        .insert(encryption(9).id(), wrong.clone());
+    assert!(snapshot.validate().is_err());
+    snapshot.index_keys.clear();
+    wrong[4] ^= 1;
+    snapshot.index_keys.insert(id, wrong);
+    assert!(snapshot.validate().is_err());
+}
+
+fn attachment_chunks(count: usize) -> Vec<Vec<u8>> {
+    use kagitaba_core::crypto::{Ciphertext, ContentKey};
+    let mut rng = rand_chacha::ChaCha20Rng::from_seed([81; 32]);
+    let key = ContentKey::from_bytes([82; 32]);
+    let bytes = vec![0; kagitaba_cxf::attachments::CHUNK_BYTES];
+    let chunk = Ciphertext::seal(&bytes, &key, b"synthetic storage fixture", &mut rng)
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    vec![chunk; count]
+}
+fn attach(snapshot: &mut Snapshot, owner: u8, blob: u8, count: usize) {
+    snapshot
+        .attachments
+        .entry(EntryId::from_bytes([owner; 16]))
+        .or_default()
+        .insert(
+            EntryId::from_bytes([blob; 16]).to_string(),
+            AttachmentBlob::from_chunks(&attachment_chunks(count)).unwrap(),
+        );
+}
+
+#[test]
+fn attachment_layout_and_revision_policy() {
+    let (_dir, _key, left, _) = pair();
+    let mut old = left.snapshot.clone();
+    attach(&mut old, 1, 11, 1);
+    let encoded = files(&old).unwrap();
+    let decoded = snapshot_from_files(encoded.clone()).unwrap();
+    assert_eq!(decoded.attachments, old.attachments);
+    let path = format!(
+        "entries/{}/attachments/{}",
+        EntryId::from_bytes([1; 16]),
+        EntryId::from_bytes([11; 16])
+    );
+    assert!(encoded.contains_key(&path));
+    let mut bad = encoded.clone();
+    bad.insert(path.clone(), FileData::Bytes(vec![0]));
+    assert!(snapshot_from_files(bad).is_err());
+    let mut bad = old.clone();
+    attach(&mut bad, 2, 12, 1);
+    assert!(bad.validate().is_err());
+    let mut next = old.clone();
+    attach(&mut next, 1, 12, 1);
+    assert!(validate_transition(&old, &next).is_err());
+    next.wallet = next.wallet.with_entry(entry(1, 2)).unwrap();
+    assert!(validate_transition(&old, &next).is_ok());
+    let mut modified = next.clone();
+    let mut changed = attachment_chunks(1);
+    changed[0][80] ^= 1;
+    modified
+        .attachments
+        .get_mut(&EntryId::from_bytes([1; 16]))
+        .unwrap()
+        .insert(
+            EntryId::from_bytes([11; 16]).to_string(),
+            AttachmentBlob::from_chunks(&changed).unwrap(),
+        );
+    assert!(validate_transition(&old, &modified).is_err());
+    let primary = entry(1, 3).primary().clone();
+    next.wallet = next
+        .wallet
+        .with_entry(Entry::from_parts(primary, []).unwrap())
+        .unwrap();
+    assert!(validate_transition(&old, &next).is_err());
+    next.attachments
+        .get_mut(&EntryId::from_bytes([1; 16]))
+        .unwrap()
+        .remove(&EntryId::from_bytes([11; 16]).to_string());
+    assert!(validate_transition(&old, &next).is_ok());
+}
+
+#[test]
+fn attachments_are_atomic_with_their_owner_in_merges() {
+    let (_dir, key, mut left, mut right) = pair();
+    let mut next = left.snapshot.clone();
+    next.wallet = next.wallet.with_entry(entry(1, 2)).unwrap();
+    attach(&mut next, 1, 11, 1);
+    left.save(next, &key, "Attach synthetic file").unwrap();
+    put(&mut right, &key, entry(1, 3), "Concurrent edit");
+    assert!(left.merge_from(&right.path, &key).is_err());
+}
+
+#[test]
+fn attachment_larger_than_sixteen_mib_survives_backup_and_transfer() {
+    let (dir, key, mut left, mut right) = pair();
+    let mut next = left.snapshot.clone();
+    next.wallet = next.wallet.with_entry(entry(1, 2)).unwrap();
+    attach(&mut next, 1, 11, 17);
+    left.save(next, &key, "Attach synthetic large file")
+        .unwrap();
+    left.backup_to(&dir.path().join("large-backup")).unwrap();
+    let backup = Store::open(
+        &dir.path().join("large-backup"),
+        key.public.clone(),
+        Some(left.head),
+    )
+    .unwrap();
+    assert_eq!(backup.snapshot.attachments, left.snapshot.attachments);
+    right
+        .import_transfer(&left.export_transfer().unwrap())
+        .unwrap();
+    assert_eq!(right.snapshot.attachments, left.snapshot.attachments);
+}
+
+#[test]
+fn signed_attachment_changes_cannot_bypass_transition_validation() {
+    let (_dir, key, mut left, _) = pair();
+    let original = left.head;
+    let mut bad = left.snapshot.clone();
+    attach(&mut bad, 1, 11, 1);
+    let candidate = signed_tree(&left, &[left.head], &bad, &key);
+    assert!(left.accept(candidate).is_err());
+    assert_eq!(left.head, original);
+}
+
+#[test]
+fn independent_attachment_entries_merge_and_owner_delete_removes_files() {
+    let (_dir, key, mut left, mut right) = pair();
+    let mut next = left.snapshot.clone();
+    next.wallet = next.wallet.with_entry(entry(1, 2)).unwrap();
+    attach(&mut next, 1, 11, 1);
+    left.save(next, &key, "First attachment").unwrap();
+    let mut next = right.snapshot.clone();
+    next.wallet = next.wallet.with_entry(entry(2, 1)).unwrap();
+    attach(&mut next, 2, 12, 1);
+    right.save(next, &key, "Other owner").unwrap();
+    left.merge_from(&right.path, &key).unwrap();
+    assert_eq!(left.snapshot.attachments.len(), 2);
+    let id = EntryId::from_bytes([1; 16]);
+    let mut next = left.snapshot.clone();
+    next.wallet = next.wallet.without_entry(id).unwrap();
+    assert!(next.validate().is_err());
+    next.attachments.remove(&id);
+    left.save(next, &key, "Delete owner").unwrap();
+    assert!(
+        files(&left.snapshot)
+            .unwrap()
+            .keys()
+            .all(|path| !path.starts_with(&format!("entries/{id}/")))
+    );
+}
+
+#[test]
+fn opening_wallet_defers_attachment_contents_until_requested() {
+    let (_dir, key, mut left, _) = pair();
+    let mut next = left.snapshot.clone();
+    next.wallet = next.wallet.with_entry(entry(1, 2)).unwrap();
+    attach(&mut next, 1, 11, 1);
+    left.save(next, &key, "Lazy attachment").unwrap();
+    let blob = &left.snapshot.attachments[&EntryId::from_bytes([1; 16])]
+        [&EntryId::from_bytes([11; 16]).to_string()];
+    let oid = blob.oid().to_string();
+    let object = left
+        .repo
+        .git_dir()
+        .join("objects")
+        .join(&oid[..2])
+        .join(&oid[2..]);
+    let mut compressed = std::fs::read(&object).unwrap();
+    *compressed.last_mut().unwrap() ^= 1;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(object, compressed).unwrap();
+    // Reading signed metadata needs only the object's header, not its payload.
+    let reopened = Store::open(&left.path, key.public.clone(), Some(left.head)).unwrap();
+    let lazy = &reopened.snapshot.attachments[&EntryId::from_bytes([1; 16])]
+        [&EntryId::from_bytes([11; 16]).to_string()];
+    // Explicit access authenticates the Git object before exposing its contents.
+    let result = lazy.open().and_then(|mut reader| {
+        std::io::copy(&mut reader, &mut std::io::sink()).map_err(|_| Error::Invalid)
+    });
+    assert!(result.is_err());
 }

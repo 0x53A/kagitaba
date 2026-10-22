@@ -165,6 +165,35 @@ fn files(identity: &Value) -> Value {
 }
 
 #[test]
+fn snapshot_checks_index_key_recipient_ownership_and_cache_bounds() {
+    use kagitaba_core::crypto::{ContentKey, PublicKey, WrappedKey};
+    let identity = identity(1);
+    let mut files = files(&identity);
+    let id = identity["participantId"].as_str().unwrap();
+    let key = PublicKey::from_pem(identity["participantPem"].as_str().unwrap()).unwrap();
+    let wrapper = WrappedKey::wrap(
+        &ContentKey::from_bytes([9; 32]), &key, b"index-test",
+        &mut ChaCha20Rng::from_seed([7; 32]),
+    ).unwrap();
+    let key_path = format!("participants/{id}/index-key");
+    let cache_path = format!("cache/{id}/index");
+    files[&key_path] = b64(wrapper.as_bytes()).into();
+    files[&cache_path] = b64(b"disposable cache, rebuild if invalid").into();
+    call(json!({"op":"validate_snapshot","files":files}), 1).unwrap();
+    let mut wrong = files.clone();
+    wrong.as_object_mut().unwrap().remove(&key_path);
+    assert!(call(json!({"op":"validate_snapshot","files":wrong}), 1).is_err());
+    let mut wrong = files.clone();
+    wrong[&cache_path] = b64(vec![0; 2 * 1024 * 1024 + 1]).into();
+    assert!(call(json!({"op":"validate_snapshot","files":wrong}), 1).is_err());
+    let mut wrong = files.clone();
+    wrong[format!("participants/{}/index-key", "00".repeat(32))] = wrong[&key_path].clone();
+    assert!(call(json!({"op":"validate_snapshot","files":wrong}), 1).is_err());
+    files[&key_path] = b64(b"malformed wrapper").into();
+    assert!(call(json!({"op":"validate_snapshot","files":files}), 1).is_err());
+}
+
+#[test]
 fn snapshot_checks_canonical_paths_registered_grants_and_revision_transitions() {
     let identity = identity(1);
     let mut files = files(&identity);
@@ -330,4 +359,86 @@ fn local_secrets_bind_identity_remote_context_and_ciphertext() {
     assert!(call(json!({"op":"local_encrypt","identity":alice["identity"],"context":"x".repeat(4097),"plaintext":"token"}),5).is_err());
     assert!(call(json!({"op":"local_encrypt","identity":alice["identity"],"context":context,"plaintext":"x".repeat(16385)}),5).is_err());
     assert!(block_on(execute(&json!({"op":"local_encrypt","identity":alice["identity"],"context":context,"plaintext":"token"}).to_string(),vec![])).is_err());
+}
+
+#[test]
+fn attachment_snapshots_require_owned_paths_revision_changes_and_rekey_on_revocation() {
+    use kagitaba_core::crypto::{Ciphertext, ContentKey};
+    use kagitaba_cxf::attachments::encode_blob;
+    let own = identity(1);
+    let id = hex::encode([7;16]);
+    let mut files = files(&own);
+    let encrypted = call(json!({"op":"entry_encrypt","entryId":id,"payload":payload(),"recipients":[own["participantPem"]]}),2).unwrap();
+    let primary = format!("entries/{id}/primary");
+    let grant = format!("entries/{id}/grants/{}",own["participantId"].as_str().unwrap());
+    let blob = format!("entries/{id}/attachments/{}", "ab".repeat(16));
+    let sealed = Ciphertext::seal(b"synthetic file", &ContentKey::from_bytes([9;32]), b"test", &mut ChaCha20Rng::from_seed([4;32])).unwrap();
+    let container = encode_blob(&[sealed.as_bytes().to_vec()]).unwrap();
+    files[&primary] = encrypted["primary"].clone();
+    files[&grant] = encrypted["grants"][own["participantId"].as_str().unwrap()].clone();
+    files[&blob] = b64(&container).into();
+    call(json!({"op":"validate_snapshot","files":files}),1).unwrap();
+    for invalid in [format!("entries/{id}/attachments/{}","AB".repeat(16)),format!("entries/{}/attachments/{}","00".repeat(16),"ab".repeat(16)),format!("{blob}/00000000")] {
+        let mut bad=files.clone();bad[&invalid]=bad[&blob].clone();bad.as_object_mut().unwrap().remove(&blob);
+        assert!(call(json!({"op":"validate_snapshot","files":bad}),1).is_err());
+    }
+    let mut deferred=files.clone();deferred[&blob]=b64([0u8;88]).into();
+    assert!(call(json!({"op":"validate_snapshot","files":deferred}),1).is_ok());
+    let mut bad=files.clone();bad[&blob]=b64(b"KAF1\0\0\0\0").into();
+    assert!(call(json!({"op":"validate_snapshot","files":bad}),1).is_err());
+    let mut bad=files.clone();bad[format!("participants/{}/meta.entry",own["participantId"].as_str().unwrap())]=b64(format!("{id}\n")).into();
+    assert!(call(json!({"op":"validate_snapshot","files":bad}),1).is_err());
+    let mut removed=files.clone();removed.as_object_mut().unwrap().remove(&blob);
+    assert!(call(json!({"op":"validate_snapshot","files":removed,"previous":files}),1).is_err());
+    let revision=call(json!({"op":"entry_encrypt","entryId":id,"payload":payload(),"recipients":[own["participantPem"]]}),5).unwrap();
+    removed[&primary]=revision["primary"].clone();removed[&grant]=revision["grants"][own["participantId"].as_str().unwrap()].clone();
+    call(json!({"op":"validate_snapshot","files":removed,"previous":files}),1).unwrap();
+    let mut replaced=removed.clone();
+    let mut changed=container.clone();*changed.last_mut().unwrap()^=1;
+    replaced[&blob]=b64(changed).into();
+    assert!(call(json!({"op":"validate_snapshot","files":replaced,"previous":files}),1).is_err());
+    let mut revoked=removed.clone();revoked[&blob]=files[&blob].clone();revoked.as_object_mut().unwrap().remove(&grant);
+    assert!(call(json!({"op":"validate_snapshot","files":revoked,"previous":files}),1).is_err());
+    let rotated=format!("entries/{id}/attachments/{}","cd".repeat(16));revoked[rotated]=revoked[&blob].clone();revoked.as_object_mut().unwrap().remove(&blob);
+    call(json!({"op":"validate_snapshot","files":revoked,"previous":files}),1).unwrap();
+    call(json!({"op":"validate_snapshot","files":self::files(&own),"previous":files}),1).unwrap();
+}
+
+#[test]
+fn ordinary_attachment_edits_preserve_complete_owned_manifests() {
+    use kagitaba_cxf::{Payload,attachments};
+    let id=hex::encode([7;16]);
+    let original=Payload::from_json(id.parse().unwrap(),payload().as_bytes()).unwrap();
+    let (attached,_)=attachments::add(&original,"synthetic.txt",b"test",&mut ChaCha20Rng::from_seed([6;32])).unwrap();
+    let raw=String::from_utf8(attached.to_json().unwrap().to_vec()).unwrap();
+    let edited=call(json!({"op":"payload_edit","entryId":id,"payload":raw,"changes":{"title":"New title"}}),1).unwrap();
+    call(json!({"op":"validate_attachment_edit","entryId":id,"payload":edited["payload"],"previousPayload":raw}),1).unwrap();
+    assert!(call(json!({"op":"validate_attachment_edit","entryId":id,"payload":raw}),1).is_err());
+    assert!(call(json!({"op":"validate_attachment_edit","entryId":id,"payload":payload(),"previousPayload":raw}),1).is_err());
+    let mut altered:Value=serde_json::from_str(&raw).unwrap();
+    altered["entity"]["credentials"].as_array_mut().unwrap().last_mut().unwrap()["name"]="renamed".into();
+    assert!(call(json!({"op":"validate_attachment_edit","entryId":id,"payload":altered.to_string(),"previousPayload":raw}),1).is_err());
+}
+
+#[test]
+fn passkey_assertions_preserve_validated_credential_backup_flags_in_signed_auth_data() {
+    let client = |kind| b64(json!({"type":kind,"challenge":b64([9;32]),"origin":"https://example.test"}).to_string());
+    let registered=call(json!({"op":"passkey_create","rpId":"example.test","userHandle":b64([1;16]),"clientDataJSON":client("webauthn.create"),"uv":true}),4).unwrap();
+    let public=VerifyingKey::from_public_key_der(&bytes(&registered["publicKey"])).unwrap();
+    let hash=Sha256::digest(URL_SAFE_NO_PAD.decode(client("webauthn.get")).unwrap());
+    for (eligible,state,flags) in [(false,false,0x05),(true,false,0x0d),(true,true,0x1d)] {
+        for supplied_hash in [false,true] {
+            let mut request=json!({"op":"passkey_assert","rpId":"example.test","privateKey":registered["privateKey"],"clientDataJSON":client("webauthn.get"),"uv":true,"kagitabaBackupFlags":{"eligible":eligible,"state":state}});
+            if supplied_hash { request["clientDataHash"]=b64(hash.as_slice()).into();request.as_object_mut().unwrap().remove("clientDataJSON"); }
+            let signed=call(request,5).unwrap();let mut message=bytes(&signed["authenticatorData"]);
+            assert_eq!(message[32],flags);assert_eq!(&message[33..37],&[0;4]);message.extend_from_slice(&hash);
+            let signature=Signature::from_der(&bytes(&signed["signature"])).unwrap();public.verify(&message,&signature).unwrap();
+            message[32]^=0x08;assert!(public.verify(&message,&signature).is_err());
+        }
+    }
+    for invalid in [json!(null),json!({}),json!({"eligible":true}),json!({"eligible":"true","state":false}),json!({"eligible":false,"state":true}),json!({"eligible":true,"state":1})] {
+        for op in ["passkey_assert","passkey_validate"] {
+            assert!(call(json!({"op":op,"rpId":"example.test","privateKey":registered["privateKey"],"clientDataJSON":client("webauthn.get"),"uv":true,"kagitabaBackupFlags":invalid}),5).is_err());
+        }
+    }
 }

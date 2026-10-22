@@ -173,6 +173,7 @@ def main():
         raise ValueError("Cargo.lock changed during the build")
     output.mkdir(parents=True, exist_ok=True)
     shutil.copy2(binary, output / "kagitaba-app")
+    shutil.copy2(ROOT / "assets/fonts/LICENSE", output / "FONT-LICENSE.txt")
     shutil.copy2(precursor_path, output / "cargo-sbom.json")
     write_json(output / "sbom.spdx.json", sbom)
     write_json(output / "licenses.json", licenses)

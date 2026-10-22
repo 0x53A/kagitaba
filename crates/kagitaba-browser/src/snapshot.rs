@@ -7,6 +7,7 @@ struct Snapshot {
     wallet: Wallet,
     signers: BTreeMap<KeyId, PublicKey>,
     metadata: BTreeMap<KeyId, EntryId>,
+    attachments: BTreeMap<EntryId, BTreeMap<String, [u8; 32]>>,
 }
 
 fn read(files: &Value) -> Result<Snapshot> {
@@ -29,17 +30,45 @@ fn read(files: &Value) -> Result<Snapshot> {
     let mut browsers = BTreeMap::new();
     let mut names = BTreeMap::new();
     let mut metadata = BTreeMap::new();
+    let mut index_keys = std::collections::BTreeSet::new();
+    let mut indexes = std::collections::BTreeSet::new();
     let mut primaries = BTreeMap::new();
+    let mut attachments: BTreeMap<EntryId, BTreeMap<String, [u8; 32]>> = BTreeMap::new();
     let mut grants: BTreeMap<EntryId, Vec<GrantRecord>> = BTreeMap::new();
     let mut total = 0usize;
     for (path, encoded) in files {
         let data = decode(encoded.as_str().ok_or(Error)?)?;
         total = total.checked_add(data.len()).ok_or(Error)?;
-        if total > 64 * 1024 * 1024 {
+        if total > 256 * 1024 * 1024 {
             return Err(Error);
         }
         let parts: Vec<_> = path.split('/').collect();
         match parts.as_slice() {
+            ["entries", id, "attachments", blob] => {
+                let id: EntryId = id.parse().map_err(|_| Error)?;
+                let _: EntryId = blob.parse().map_err(|_| Error)?;
+                // Match native lazy reads: container validation is deferred until file access.
+                if !(88..=kagitaba_cxf::attachments::MAX_BLOB_BYTES).contains(&data.len()) { return Err(Error); }
+                let blobs = attachments.entry(id).or_default();
+                blobs.insert((*blob).to_owned(), Sha256::digest(&data).into());
+                if blobs.len() > 128 { return Err(Error); }
+            }
+            ["participants", id, "index-key"] => {
+                let id: KeyId = id.parse().map_err(|_| Error)?;
+                let wrapped = kagitaba_core::crypto::WrappedKey::from_bytes(&data)
+                    .map_err(|_| Error)?;
+                if wrapped.recipient() != id {
+                    return Err(Error);
+                }
+                index_keys.insert(id);
+            }
+            ["cache", id, "index"] => {
+                let id: KeyId = id.parse().map_err(|_| Error)?;
+                if data.len() > 2 * 1024 * 1024 {
+                    return Err(Error);
+                }
+                indexes.insert(id);
+            }
             ["participants", id, "meta.entry"] => {
                 let text = std::str::from_utf8(&data).map_err(|_| Error)?;
                 let entry: EntryId = text.strip_suffix('\n').ok_or(Error)?.parse().map_err(|_| Error)?;
@@ -134,6 +163,8 @@ fn read(files: &Value) -> Result<Snapshot> {
         || signers.keys().any(|id| !keys.contains_key(id))
         || devices.iter().any(|id| !keys.contains_key(id))
         || names.keys().any(|id| !keys.contains_key(id))
+        || index_keys.iter().any(|id| !keys.contains_key(id))
+        || indexes.iter().any(|id| !index_keys.contains(id))
     {
         return Err(Error);
     }
@@ -212,7 +243,11 @@ fn read(files: &Value) -> Result<Snapshot> {
         if !wallet.participants().contains_key(participant) || !wallet.entries().contains_key(entry)
             || !seen.insert(entry) || names.contains_key(participant) { return Err(Error); }
     }
+    if attachments.keys().any(|id| !wallet.entries().contains_key(id) || seen.contains(id)) {
+        return Err(Error);
+    }
     Ok(Snapshot {
+        attachments,
         metadata,
         wallet,
         signers,
@@ -224,6 +259,20 @@ pub(super) fn operation(request: &Value) -> Result<Value> {
     if let Some(previous) = request.get("previous").filter(|v| !v.is_null()) {
         let previous = read(previous)?;
         for (id, entry) in snapshot.wallet.entries() {
+            if previous.attachments.get(id).is_some_and(|old_blobs|
+                snapshot.attachments.get(id).is_some_and(|new_blobs|
+                    old_blobs.iter().any(|(blob, digest)| new_blobs.get(blob).is_some_and(|next| next != digest))))
+            { return Err(Error); }
+            if let Some(old) = previous.wallet.entries().get(id)
+                && old.grants().keys().any(|recipient| !entry.grants().contains_key(recipient))
+                && previous.attachments.get(id).is_some_and(|old_blobs|
+                    snapshot.attachments.get(id).is_some_and(|new_blobs|
+                        old_blobs.keys().any(|blob| new_blobs.contains_key(blob))))
+            { return Err(Error); }
+            if let Some(old) = previous.wallet.entries().get(id)
+                && snapshot.attachments.get(id) != previous.attachments.get(id)
+                && old.primary().revision_id() == entry.primary().revision_id()
+            { return Err(Error); }
             if let Some(old) = previous.wallet.entries().get(id)
                 && old.primary() != entry.primary()
                 && old.primary().revision_id() == entry.primary().revision_id()

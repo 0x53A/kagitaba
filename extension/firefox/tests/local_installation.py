@@ -15,14 +15,17 @@ def seed_installation(driver, installation):
             const db=request.result, tx=db.transaction('records','readwrite');
             tx.objectStore('records').put(installation,'installation');
             tx.onerror=()=>done(false);
-            tx.oncomplete=async()=>{db.close();const bg=await browser.runtime.getBackgroundPage();bg.location.reload();done(true);};
+            tx.oncomplete=async()=>{db.close();const bg=await browser.runtime.getBackgroundPage();bg.kagitabaTestReloadPending=true;bg.location.reload();done(true);};
         };
     """, installation)
     assert result
     for _ in range(100):
         status = driver.execute_async_script("""
             const done=arguments[arguments.length-1];
-            browser.runtime.sendMessage({type:'status'}).then(s=>done(s?.installation?.participantId??null),()=>done(null));
+            browser.runtime.getBackgroundPage().then(bg=>{
+                if(!bg||bg.kagitabaTestReloadPending){done(null);return;}
+                browser.runtime.sendMessage({type:'status'}).then(s=>done(s?.installation?.participantId??null),()=>done(null));
+            },()=>done(null));
         """)
         if status == installation["participantId"]:
             return

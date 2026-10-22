@@ -10,6 +10,7 @@ use crate::{Document, Error, MAX_DOCUMENT_BYTES, Result};
 pub struct Conversion {
     pub(crate) document: Document,
     pub(crate) report: ConversionReport,
+    pub(crate) attachments: Vec<SourceAttachment>,
 }
 impl Conversion {
     /// Borrow the CXF document; its items include preserved source metadata.
@@ -20,10 +21,31 @@ impl Conversion {
     pub fn report(&self) -> &ConversionReport {
         &self.report
     }
-    /// Take ownership of the CXF document.
+    /// Extracted files are separate from JSON and require application-owned import.
+    pub fn attachments(&self) -> &[SourceAttachment] {
+        &self.attachments
+    }
+    /// Consume all conversion results, including separately held file bytes.
+    pub fn into_parts(self) -> (Document, ConversionReport, Vec<SourceAttachment>) {
+        (self.document, self.report, self.attachments)
+    }
+    /// Take ownership of the CXF document, discarding separately extracted files.
+    /// Review `report()` first: attachment warnings remain for this legacy path.
+    /// Applications importing owned files must use `into_parts()` instead.
     pub fn into_document(self) -> Document {
         self.document
     }
+}
+
+/// A source file associated with one converted CXF item. No Debug/Clone: contents
+/// and filenames are sensitive, and owned allocations are wiped on drop.
+pub struct SourceAttachment {
+    /// Exact converted CXF item ID, retained as `source.originalId` by planning.
+    pub source_item_id: String,
+    /// Display filename; applications validate it before owned-file creation.
+    pub name: Zeroizing<String>,
+    /// File bytes, never embedded in the conversion's JSON document.
+    pub bytes: Zeroizing<Vec<u8>>,
 }
 
 /// Counts and non-secret warnings from translating another manager's format.
@@ -43,6 +65,18 @@ pub struct ImportWarning {
     pub item_index: Option<usize>,
     /// The category of the limitation.
     pub kind: WarningKind,
+    /// Static diagnostics; never contains source values or user-defined names.
+    pub detail: Option<WarningDetail>,
+}
+/// Non-secret explanation and recovery guidance for one conversion warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarningDetail {
+    /// Explanation without source values.
+    pub reason: &'static str,
+    /// Safe next step; never invents replacement credential material.
+    pub action: &'static str,
+    /// Known schema field or static wildcard, never a user-defined field name.
+    pub field: Option<&'static str>,
 }
 /// Conversion limitations, including excluded data and preserved inactive features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +95,7 @@ pub enum WarningKind {
     MissingCollection,
     /// Source requires an additional unlock prompt; the app must implement it.
     Reprompt,
-    /// Attachments are not imported by this converter.
+    /// Files require separate handling; JSON alone does not import attachment bytes.
     Attachments,
     /// Entry history is preserved as source metadata, not active credentials.
     History,
@@ -73,8 +107,12 @@ pub enum WarningKind {
     FieldReferences,
 }
 impl ConversionReport {
+    #[cfg(feature = "keepass")]
+    pub(crate) fn warn_detail(&mut self, item_index: Option<usize>, kind: WarningKind, detail: WarningDetail) {
+        self.warnings.push(ImportWarning { item_index, kind, detail: Some(detail) });
+    }
     pub(crate) fn warn(&mut self, item_index: Option<usize>, kind: WarningKind) {
-        self.warnings.push(ImportWarning { item_index, kind });
+        self.warnings.push(ImportWarning { item_index, kind, detail: None });
     }
 }
 
@@ -177,14 +215,14 @@ pub(crate) fn totp(input: &str) -> Option<Value> {
             return None;
         }
         seed = Zeroizing::new(params.get("secret")?.clone());
-        for (name, default) in [("period", 30u16), ("digits", 6u16)] {
+        for (name, default) in [("period", 30u64), ("digits", 6u64)] {
             let n = params
                 .get(name)
-                .map(|s| s.parse::<u16>())
+                .map(|s| s.parse::<u64>())
                 .transpose()
                 .ok()?
                 .unwrap_or(default);
-            if n == 0 || (name == "digits" && !matches!(n, 6..=8)) {
+            if n == 0 {
                 return None;
             }
             result[name] = n.into();

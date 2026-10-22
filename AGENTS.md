@@ -29,10 +29,11 @@ randomness internally. Hardware operations are async, with no `Send` bound or
 runtime dependency. Crate forbids unsafe code; dependencies have their own audit
 boundaries. No claim that all dependency internals are free of unsafe Rust.
 
-An application could encrypt a descriptor containing a large object's key and
-location. Chunk encryption/mutable large objects are explicitly OUT OF SCOPE for
-this PoC. Rotating the descriptor's encryption key would not revoke a retained
-key to that external object.
+Immutable owned attachments use application-level chunk encryption while keeping
+the core ciphertext limit unchanged. See `ATTACHMENT-FORMAT.md`. Mutable objects
+and remote attachment storage remain out of scope. Revocation must re-encrypt
+retained attachments with fresh keys and blob IDs; rotating only the descriptor
+would not revoke a retained attachment key.
 
 ## Agreed storage and lifecycle (application-owned)
 
@@ -44,6 +45,30 @@ participants/<key-id>/<optional participant metadata>
 entries/<entry-id>/primary
 entries/<entry-id>/grants/<key-id>
 ```
+
+Owned attachment ciphertext lives at `entries/<entry-id>/attachments/<blob-id>`.
+Each file belongs to exactly one entry; there is no shared attachment pool. Its
+name, size, hash and key live in a file credential inside the encrypted primary.
+The whole entry directory is one merge unit. An attachment change requires a new
+primary revision; removing a recipient also replaces all retained attachment
+blobs. Signed readers reject attachment paths without an owner and retained old
+blob IDs after a grant reduction. Applications check the decrypted descriptor/blob
+membership when opening entry details or using files. Native opening validates
+signed paths and object headers; container
+validation and object hash verification occur when attachment contents are used.
+Newly staged containers are checked before commit. Historical recipients retain historical access.
+Limits are 64 MiB plaintext per file, 128 files per entry, 256 MiB per snapshot
+and 512 MiB of reachable transfer objects. These remain resource bounds. Native/store snapshots retain Git object IDs and
+sizes for attachments; opening, indexing and searching do not load their bytes.
+Explicit file access streams through bounded buffers and private staging files,
+including loose and packed/delta Git objects. Native add/export/revocation use
+1 MiB crypto chunks. JSON browser/JNI transfer bridges remain buffered; the store
+also exposes a streaming transfer writer. Older readers that reject
+attachment paths must be upgraded before opening wallets containing attachments.
+These attachment reader changes currently describe source support. The previously
+signed Firefox 0.1.2 XPI predates attachment support; its unchanged source version
+number is not evidence of an upgraded installed artifact. Build and validate new
+client artifacts before sharing attachment-bearing wallets with those clients.
 
 Public keys use canonical DER SubjectPublicKeyInfo, optionally PEM `PUBLIC KEY`.
 The key ID is lowercase hex SHA-256(canonical DER), not a hash of the PEM text.
@@ -126,7 +151,13 @@ Bootstrap trust/rollback handling and semantic conflict UI remain app work.
 Optional master recipients, per-participant ownership signatures, proxy
 re-encryption, and standalone authorisation records are deferred.
 
-## Agreed participant index design (not yet implemented)
+## Participant index design and implementation
+
+The native client implements this index through `kagitaba-store::index`.
+See `INDEX-FORMAT.md` for the exact versioned encoding, extraction rules, bounds
+and failure behavior. Firefox/Android Rust readers and the Firefox JavaScript
+history verifier accept and preserve the new paths; browser listing still uses
+its existing flow.
 
 Persist each participant's reconstructable encrypted index at `/cache/<p>/index`
 (paths are wallet-root-relative). The repository holds the index and its wrapped
@@ -137,9 +168,12 @@ opened/used or when their index rows need rebuilding. Index rows contain entry
 IDs, primary digests, titles, account/usernames, URLs/scopes and presence flags
 for password, TOTP and passkey credentials. Support multiple usernames/scopes;
 presence does not imply that a preserved credential type is supported for use.
+Collection rows also cache their nested hierarchy and direct local item links for
+collection navigation without additional entry decryption. See
+`COLLECTIONS-DESIGN.md` for filter and access semantics.
 
 Generate one random index key per participant, wrap it exclusively to that
-participant, and persist the wrapper outside the disposable cache, provisionally
+participant, and persist the wrapper outside the disposable cache
 at `participants/<p>/index-key`. Provision and sync this key before independent
 rebuilds; independently generated keys cannot produce identical indexes. The key
 belongs to authoritative participant metadata and is removed on revocation.
@@ -168,9 +202,10 @@ edit/delete, omit that participant's entire cache tree from the merged snapshot.
 Removed participants have no cache in the result. Historical commits remain
 unchanged. This is a deterministic merge-verification rule for received commits
 as well as locally created merges; cache conflicts never block a merge, while
-authoritative data keeps its existing conflict rules. All wallet readers must
-support the new paths before writers introduce them; current readers reject
-unknown paths. Exact cache wire encoding and bounds remain implementation work.
+authoritative data keeps its existing conflict rules. All current wallet readers
+support these paths; older clients that reject unknown paths must be updated before opening index-bearing wallets. The current v2 cache encoding
+and bounds are specified in `INDEX-FORMAT.md`. Version 1 caches rebuild after unlock
+to correct empty-password presence flags; participant index-key wrappers are unchanged.
 
 ## Future Linux passkey provider
 
@@ -300,6 +335,35 @@ distinct namespaces; the existing import planner allocates fresh wallet-local ID
 The synthetic CXF header uses timestamp zero (unknown), not the current time.
 
 Login fields, notes, custom fields and standard TOTP seeds/URIs map to CXF.
+KeePass `TimeOtp-Secret` (UTF-8), `-Hex`, `-Base32` and `-Base64` map to active
+TOTP with `TimeOtp-Length`, `TimeOtp-Period` and `TimeOtp-Algorithm` settings.
+Defaults are six digits, 30 seconds and HMAC-SHA-1; SHA-256/512 are supported.
+Only locally usable six-to-eight-digit configurations activate. Invalid or
+ambiguous settings, unknown TimeOtp fields and unresolved references retain their
+custom fields with an OTP warning. Successfully mapped fields remain in encrypted
+source provenance but are omitted from redundant custom-field credentials.
+Equivalent `otp` and TimeOtp configurations deduplicate; distinct ones are retained.
+Mapping reference: https://keepass.info/help/base/placeholders.html#otp
+KeePass `KP2A_URL_<number>` web URLs join the entry scope, with duplicate URLs
+removed and the primary URL first. Non-web/credential-bearing URLs remain custom
+source data with a matching-policy warning. Ordinary supported custom fields are
+editable across clients and no longer count as unknown credentials; PIN-labelled
+strings default to concealed UI without changing their stored type.
+
+KPEX passkeys map to active CXF credentials only for valid P-256 PKCS#8 PEM,
+base64url credential/user IDs and a valid RP domain. Missing KPEX BE/BS flags
+default individually to false for legacy imports; explicit values are preserved.
+Malformed or inconsistent flags, PRF/counter/unknown passkey extensions and
+unsupported algorithms remain preserved with warnings. Imported credentials carry the
+application extension `kagitabaBackupFlags: {eligible: bool, state: bool}`;
+BS=true requires BE=true. All providers copy these flags from the credential,
+never the site's request, into signed authenticator data. Absent flags retain
+legacy behavior (BE=true, BS=false); malformed flags make the credential unusable.
+Older installed WASM/JNI clients do not enforce this extension and must be upgraded
+before using these imported passkeys through standalone browser/Android providers.
+The native gateway uses the updated native provider. This extension does not
+change cryptographic wire formats or CXF's zero signature counter policy.
+
 Bitwarden zero-counter discoverable passkeys with structurally valid PKCS#8 keys
 map to passkey credentials. Other passkeys and OTP variants remain source metadata
 with warnings. Cards, identities and SSH items are retained as opaque credentials.
@@ -311,8 +375,13 @@ remain literal and produce warnings; plugin-specific fields remain custom fields
 Original active item data, including history, are retained in vendor extensions
 inside the encrypted payloads. These extensions are provenance, not authoritative
 current values after subsequent editing. They can retain old passwords until an
-explicit cleanup is implemented. KeePass attachment bytes and custom icon blobs
-are not imported; attachment references produce warnings. Trash/recycle-bin items
+explicit cleanup is implemented. KeePass active-entry attachment bytes are exposed
+separately by `Conversion::attachments` / `into_parts`, keyed to the converted
+source item ID; they are never embedded in CXF JSON. Native import encrypts those
+files into owned attachment staging during preview and commits them with their
+entries. Document-only consumers (`into_document`) discard separate bytes and
+must retain attachment warnings. Bitwarden JSON provides references only; missing
+file bytes remain an explicit omission. Custom icon blobs are not imported. Trash/recycle-bin items
 are excluded, with warnings. This is not a lossless backup of the source database.
 Keep source backups until the app can review these limitations. Empty collection
 metadata remains available in the converted document and collection payloads.
@@ -334,6 +403,26 @@ Source references for mappings:
 - https://github.com/bitwarden/sdk-internal/blob/main/crates/bitwarden-exporters/src/json.rs
 - https://github.com/bitwarden/sdk-internal/blob/main/crates/bitwarden-exporters/src/cxf/login.rs
 - https://docs.rs/keepass/0.15.0/keepass/
+
+## Firefox CSV import
+
+`kagitaba_cxf::firefox::from_bytes` / `from_reader` convert Firefox password CSV
+exports into the same reviewed CXF import pipeline. Native Import offers
+**Firefox CSV**. Columns are matched by header name; `url`, `username`, and
+`password` are required. Reordered columns, UTF-8 BOM, quoted multiline fields,
+escaped quotes and CRLF are supported. Duplicate headers, invalid UTF-8,
+malformed quoting and inconsistent row widths fail without including input values
+in errors. The existing 32 MiB exchange input limit applies.
+
+Each row becomes a basic-auth item; even duplicate source GUIDs/rows remain
+separate until an explicit deduplication workflow. All source columns are preserved
+in an encrypted Firefox source extension. Millisecond creation/password-change
+timestamps map to CXF seconds; original values and last-used time remain in source
+data. HTTP realms and foreign form-action origins remain inactive with URI-policy
+warnings; ordinary origin matching must not silently broaden those restrictions.
+
+Reference: [Mozilla LoginExport.sys.mjs](https://github.com/mozilla-firefox/firefox/blob/main/toolkit/components/passwordmgr/LoginExport.sys.mjs).
+Synthetic tests cover CSV syntax, mapping, provenance and encrypted import.
 
 ## Version 1 wire formats
 
@@ -408,6 +497,12 @@ all compiler/register copies, or caller-created plaintext copies.
 
 ## Development and checks
 
+Firefox also offers a connected native gateway mode, without browser participant
+enrollment. Password and WebAuthn requests pass through an opaque Native Messaging
+bridge and a private Unix
+socket to the Linux client's explicit approval UI. See the native and extension
+AGENTS.md files for protocol, installation, scope and validation.
+
 Standalone Firefox extension design and implementation acceptance criteria:
 `FIREFOX-DESIGN.md`. Each installation is a separate software participant,
 unlocked through a physical key's WebAuthn PRF and operating on its own encrypted
@@ -421,11 +516,12 @@ The current Nix Rust package also ships `wasm32-unknown-unknown` standard librar
 ```
 nix-shell --run 'cargo test'
 nix-shell --run 'cargo clippy --all-targets -- -D warnings'
-nix-shell --run 'cargo check --target wasm32-unknown-unknown --lib'
+nix-shell --run 'cargo check -p kagitaba-core -p kagitaba-cxf --target wasm32-unknown-unknown --lib'
 nix-shell --run 'cargo fmt --check'
 ```
 
-Workspace default members include the two portable crates. For whole-workspace
+The workspace default member is `kagitaba-app`, so plain `cargo run`, `cargo build`
+and `cargo test` target the Linux app. For whole-workspace
 checks use `cargo test --workspace --all-features` and
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 The WASM check is `cargo check -p kagitaba-core -p kagitaba-cxf --target wasm32-unknown-unknown --lib`;
@@ -532,3 +628,11 @@ or private/internal repos with the applicable Enterprise Cloud capability).
 References: [Cargo precursor schema](https://doc.rust-lang.org/cargo/reference/unstable.html#sbom),
 [GitHub attest action](https://github.com/actions/attest),
 [GitHub verification policy flags](https://cli.github.com/manual/gh_attestation_verify).
+
+## Credential field and generator review
+
+`FIELD-AND-GENERATOR-DESIGN.md` records the cross-client storage-constraint review,
+implemented fixes, shared configurable password generator, TOTP camera/picture
+import and bundled readable text-field font. It records platform acquisition
+boundaries and remaining physical-device validation. Keep ordinary credential storage separate from autofill, passkey
+and remote-transport eligibility checks.

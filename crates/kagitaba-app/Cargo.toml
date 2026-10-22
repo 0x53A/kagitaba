@@ -6,25 +6,36 @@ publish = false
 
 [features]
 smoke = ["eframe/__screenshot"]
+default = ["native-dialog"]
+native-dialog = ["dep:rfd"]
 
 [dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+base64 = "0.23.1"
 data-encoding = { version = "2.11.1", default-features = false }
 eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui-file-dialog = { version = "0.15.0", default-features = false }
 futures = { version = "0.3.34", default-features = false, features = ["executor"] }
 hex = "0.4.3"
 hmac = "0.13.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+kagitaba-browser = { version = "0.1.0", path = "../kagitaba-browser" }
 kagitaba-core = { version = "0.1.0", path = "../.." }
 kagitaba-cxf = { version = "0.1.0", path = "../kagitaba-cxf", features = ["keepass"] }
 kagitaba-device = { version = "0.1.0", path = "../kagitaba-device" }
 kagitaba-store = { version = "0.1.0", path = "../kagitaba-store" }
+p256 = { version = "0.14.0", default-features = false, features = ["pkcs8", "alloc"] }
+psl = "2.1.241"
 rand = { version = "0.10.3", default-features = false, features = ["sys_rng"] }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"], optional = true }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 serde_json = { version = "1.0.151", default-features = false }
 sha1 = "0.11.0"
 sha2 = "0.11.0"
+tempfile = "3.27.0"
+url = "2.5.8"
 zeroize = { version = "1.9.1", default-features = false }
 
 [dev-dependencies]
+keepass = { version = "0.15.0", features = ["save_kdbx4", "serialization"] }
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pem"] }
-tempfile = "3.27.0"

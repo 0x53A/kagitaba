@@ -1,13 +1,16 @@
+import {collectionNodes} from './wallet-navigation.mjs';
+import {cryptoCall} from './crypto.mjs';
+import {generator,importTotp,closeTools,copySecret,totpCode} from './credential-tools.mjs';
 import {encode, decode, random, hex} from './encoding.mjs';
 const app = document.querySelector('#app'), notice = document.querySelector('#notice');
 const params = new URLSearchParams(location.search), requestId = params.get('request');
 let tabId = Number(params.get('tab'));
 async function openEntry(id, parent) {const draft=await send({type:'entry-draft',id});showEntry(JSON.parse(draft.payload),id,parent,draft);}
-let state, uiEpoch=0;
+let state, uiEpoch=0, selectedCollection=null;
 let fidoPending;
 class FidoLockedError extends Error {constructor(){super('Wallet locked. Unlock to continue.');}}
 let connectionDraft = {}, settingsDraft = {}, view = 'wallet', selectedId = null, search = '', dirty = false, busy = false, renderVersion = 0, fieldNumber = 0, requestFinished = false;
-const send = async message => {const captured=uiEpoch;const value=await browser.runtime.sendMessage(message);if(captured!==uiEpoch && !['lock','connect','status','sync'].includes(message.type))throw new Error('Wallet locked. Unlock to continue.');return value;};
+const send = async message => {const captured=uiEpoch;const value=await browser.runtime.sendMessage(message);if(captured!==uiEpoch && !['lock','connect','status','sync','backend-mode'].includes(message.type))throw new Error('Wallet locked. Unlock to continue.');return value;};
 function el(tag, content, className) {const node = document.createElement(tag); if (content !== undefined) node.textContent = content; if(className) node.className = className; return node;}
 function button(label, action, primary = false) {const node = el('button', label, primary ? 'primary' : ''); node.type='button';node.onclick = () => run(action, node); return node;}
 function field(parent, label, value = '', type = 'text') {const caption=el('label',label),input = el(type === 'textarea' ? 'textarea' : 'input');input.id=`field-${++fieldNumber}`;caption.htmlFor=input.id; if(type !== 'textarea') input.type = type; input.value = value; parent.append(caption,input); return input;}
@@ -22,7 +25,7 @@ async function fidoRequest(method, options){
   catch(error){if(epoch!==uiEpoch)throw new FidoLockedError();throw error;}
   finally{if(fidoPending===controller)fidoPending=undefined;}
 }
-function controls(){app.setAttribute('aria-busy',String(busy));for(const b of app.querySelectorAll('button'))b.disabled=busy;}
+function controls(){app.setAttribute('aria-busy',String(busy));for(const b of document.querySelectorAll('#app button, #header-refresh button, #header-tools button'))b.disabled=busy&&!b.dataset.cancelNative;}
 function canLeave(){if(dirty&&!confirm('Discard your unsaved changes?'))return false;dirty=false;return true;}
 async function navigate(next){if(!canLeave())return;view=next;selectedId=null;await render();feedback();}
 function section(title) {const node = el('section'); node.append(el('h2', title)); app.append(node); return node;}
@@ -45,36 +48,144 @@ async function setup() {
 async function unlock() {const proof=await assertion(state.installation.unlock);await send({type:'unlock',...proof});await render();feedback('Wallet unlocked.','success');}
 async function render() {
   if(requestFinished)return;
-  const version=++renderVersion,next=await send({type:'status'});if(version!==renderVersion)return;state=next;app.replaceChildren();
+  const version=++renderVersion,next=await send({type:'status'});if(version!==renderVersion)return;state=next;closeTools();app.replaceChildren();
   document.querySelector('#lock').hidden=!state.unlocked;
-  document.querySelector('#header-state').textContent=state.unlocked?'Unlocked':'Locked';
-  if(!state.installation){const node=section('1 · Protect this installation');node.append(fidoInstructions(),button('Enroll security key',setup,true),el('p','Reinstalling requires new enrollment in your wallet.','muted'));controls();return;}
+  document.querySelector('#header-name').textContent=state.backendMode==='native'?'Native app':state.replica.head?'Browser wallet':'';
+  const status=document.querySelector('#header-state'), refresh=document.querySelector('#header-refresh'), tools=document.querySelector('#header-tools');
+  status.textContent=state.unlocked?'Unlocked':'Locked';refresh.replaceChildren();tools.replaceChildren();
+  if(state.replica.head&&state.backendMode!=='native'){
+    status.textContent=state.replica.lastSync?.error?'Sync failed':state.replica.synced!==state.replica.head?'Pending changes':'Synchronized';
+    status.title=state.replica.lastSync?.error??(state.replica.syncedAt?new Date(state.replica.syncedAt).toLocaleString():'');
+    if(state.replica.remote){const sync=button('↻',synchronize);sync.classList.add('icon');sync.title=state.unlocked?'Synchronize':'Unlock & synchronize';sync.setAttribute('aria-label',sync.title);refresh.append(sync);}
+  }
+  if(!requestId){
+    const menu=disclosure(tools,'Tools');
+    menu.append(button('Password generator',()=>generator()));
+    menu.append(button(state.backendMode==='native'?'Use standalone wallet':'Use native client',async()=>{if(!canLeave())return;await send({type:'backend-mode',mode:state.backendMode==='native'?'standalone':'native'});await render();}));
+  }
+  if(state.backendMode==='native'&&!requestId){
+    document.querySelector('#header-state').textContent='Native client';
+    const node=section('Use your native wallet');
+    node.append(el('p','Open and unlock the native app.','muted'));
+    if(tabId)node.append(button('Choose login in native client',async()=>{feedback('Waiting for approval in the native client…','progress');await send({type:'native-fill',tabId});feedback('Login filled. The form was not submitted.','success');},true));
+    else node.append(el('p','Open this window from the toolbar on an HTTPS website.','muted'));
+    const cancel=el('button','Cancel request');cancel.type='button';cancel.dataset.cancelNative='true';cancel.onclick=()=>browser.runtime.sendMessage({type:'native-cancel'});node.append(cancel);
+    controls();return;
+  }
+  if(!state.installation){
+    if(view==='enrollment'){
+      app.append(button('← Back',()=>navigate('wallet')));
+      const node=section('Create enrollment request');node.append(fidoInstructions(),button('Enroll security key',setup,true));
+    }else{
+      const node=section('Open wallet');
+      node.append(button('Use native client',async()=>{await send({type:'backend-mode',mode:'native'});await render();},true),button('Create enrollment request',()=>navigate('enrollment')));
+    }
+    controls();return;
+  }
   if(requestId){await renderRequest();return;}
   if(!state.replica.head){renderConnect();return;}
   const nav=el('nav',undefined,'tabs');nav.setAttribute('aria-label','Wallet navigation');for(const [key,label] of [['wallet','Wallet'],['settings','Settings']]){const b=button(label,()=>navigate(key));b.setAttribute('aria-current',String(key==='wallet'?view==='wallet':view!=='wallet'));nav.append(b);}app.append(nav);
   if(view!=='wallet'){renderSync();controls();return;}
-  renderSyncBar();
   if(!state.unlocked){const top=section('Unlock wallet');top.append(button('Unlock with security key',unlock,true));controls();return;}
   if(state.unlocked){
     if(tabId)await renderWebsite();
     const workspace=section('Entries'),toolbar=el('div',undefined,'toolbar'),filter=el('input');filter.type='search';filter.placeholder='Search entries';filter.setAttribute('aria-label','Search entries');filter.value=search;
-    const layout=el('div',undefined,'layout'),list=el('ul',undefined,'entries'),details=el('div',undefined,'entry-detail');layout.append(list,details);toolbar.append(filter,button('New login',()=>{if(canLeave())edit(newPayload(),null,details);},true));workspace.append(toolbar,layout);
-    const draw=()=>{list.replaceChildren();const matches=state.entries.filter(e=>e.title.toLowerCase().includes(search.toLowerCase()));for(const entry of matches){const item=el('li'),b=button(entry.title||'Untitled entry',async()=>{if(!canLeave())return;selectedId=entry.id;draw();await openEntry(entry.id,details);feedback();});b.classList.toggle('selected',selectedId===entry.id);item.append(b);list.append(item);}if(!matches.length)list.append(el('li',state.entries.length?'No matching entries.':'No accessible entries.','muted'));};
+    const layout=el('div',undefined,'layout'),list=el('ul',undefined,'entries'),details=el('div',undefined,'entry-detail'),tree=el('nav',undefined,'collection-tree'),content=el('div',undefined,'collection-content'),columns=el('div',undefined,'collection-columns');
+    tree.setAttribute('aria-label','Collections');layout.append(list,details);content.append(toolbar,layout);columns.append(tree,content);toolbar.append(filter,button('New login',()=>{if(canLeave())edit(newPayload(),null,details);},true));workspace.append(columns);
+    const nodes=collectionNodes(state.entries);if(selectedCollection&&selectedCollection!=='unfiled'&&!nodes.some(n=>n.key===selectedCollection))selectedCollection=null;
+    const choose=key=>{if(!canLeave())return;selectedCollection=key;selectedId=null;render();};
+    tree.append(el('h3','Collections'));const all=button('All entries',()=>choose(null));all.setAttribute('aria-current',String(selectedCollection===null));tree.append(all);const unfiled=button('Entries not in a collection',()=>choose('unfiled'));unfiled.setAttribute('aria-current',String(selectedCollection==='unfiled'));tree.append(unfiled);
+    for(const node of nodes){const row=button(node.title,()=>choose(node.key));row.style.paddingInlineStart=`${12+node.depth*14}px`;row.setAttribute('aria-current',String(selectedCollection===node.key));tree.append(row);}
+    keepCollectionVisible();
+    const draw=()=>{list.replaceChildren();const node=nodes.find(n=>n.key===selectedCollection),items=state.entries.filter(e=>e.kind==='item'),matches=items.filter(e=>(selectedCollection==='unfiled'?!nodes.some(n=>n.items.includes(e.id)):!node||node.items.includes(e.id))&&[e.title,...(e.usernames??[]),e.id].some(v=>v.toLowerCase().includes(search.toLowerCase())));
+      if(node?.unavailable)list.append(el('li',`${node.unavailable} unavailable or external links`,'muted collection-status'));
+      for(const entry of matches){const item=el('li'),b=button('',async()=>{if(!canLeave())return;selectedId=entry.id;draw();await openEntry(entry.id,details);feedback();});b.append(el('strong',entry.title||'Untitled entry'),el('span',(entry.usernames??[]).join(' · '),'entry-usernames'),Object.assign(el('span',entry.id.slice(0,8),'entry-id'),{title:entry.id}));b.classList.toggle('selected',selectedId===entry.id);item.append(b);list.append(item);}
+      if(!matches.length)list.append(el('li',search?'No matching entries.':node?'No accessible entries in this collection.':'No accessible entries.','muted'));};
     filter.oninput=()=>{search=filter.value;draw();controls();};draw();
     if(selectedId&&state.entries.some(e=>e.id===selectedId))await openEntry(selectedId,details);
   }
   controls();
 }
-function showEntry(payload,id,parent,draft){parent.replaceChildren();const root=parent;root.classList.add('active');document.querySelector('.entries')?.setAttribute('hidden','');document.querySelector('.toolbar')?.setAttribute('hidden','');root.append(button('Back to entries',()=>{selectedId=null;render();}),el('h3',payload.entity.title||'Untitled entry'));for(const credential of payload.entity.credentials??[]){if(credential.type==='basic-auth'){const username=field(root,'Username',credential.username?.value??'');username.readOnly=true;const password=field(root,'Password',credential.password?.value??'','password');password.readOnly=true;root.append(button('Show / hide',()=>{password.type=password.type==='password'?'text':'password';feedback();}),button('Copy password',async()=>{await navigator.clipboard.writeText(password.value);feedback('Password copied.','success');}));}else if(credential.type==='passkey')root.append(el('p',`Passkey · ${credential.rpId??'website'}`));else root.append(el('p',credential.type,'muted'));}for(const origin of payload.entity.scope?.urls??[])root.append(el('p',origin,'fingerprint'));root.append(button('Edit entry',()=>{edit(payload,id,parent,draft);feedback();},true));}
+function showEntry(payload,id,parent,draft){
+ parent.replaceChildren();const root=parent;root.classList.add('active');document.querySelector('.entries')?.setAttribute('hidden','');document.querySelector('.toolbar')?.setAttribute('hidden','');
+ root.append(button('Back to entries',()=>{selectedId=null;render();}),el('h3',payload.entity.title||'Untitled entry'));
+ for(const c of payload.entity.credentials??[]){
+  const group=el('div',undefined,'credential-group');root.append(group);
+  if(c.type==='basic-auth'){
+   const username=field(group,'Username',c.username?.value??'','textarea');username.readOnly=true;
+   const password=field(group,'Password',c.password?.value??'','textarea');password.readOnly=true;password.hidden=true;
+   group.append(button('Show / hide',()=>{password.hidden=!password.hidden;}),button('Copy password',()=>copySecret(c.password?.value??'')));
+  }else if(c.type==='totp'){group.append(el('p',`TOTP · ${c.issuer??''} · ${c.username??''}`),button('Show TOTP code',()=>totpCode(c)));}
+  else if(c.type==='note'){const value=field(group,'Note',c.content?.value??'','textarea');value.readOnly=true;value.hidden=true;group.append(button('Show / hide note',()=>{value.hidden=!value.hidden;}));}
+  else if(c.type==='passkey'){
+   group.append(el('h3','Passkey'));
+   for(const [label,key,secret] of [['Relying party','rpId'],['Username','username'],['Display name','userDisplayName'],['Credential ID','credentialId'],['User handle','userHandle',true]]){
+    if(typeof c[key]!=='string'||!c[key])continue;
+    const value=field(group,label,secret?'••••••••':c[key],'textarea');value.readOnly=true;
+    if(secret){let visible=false;group.append(button('Show / hide',()=>{visible=!visible;value.value=visible?c[key]:'••••••••';}));}
+    group.append(button(`Copy ${label.toLowerCase()}`,()=>copySecret(c[key])));
+   }
+   for(const [label,key] of [['Backup eligible','eligible'],['Backed up','state']]){
+    const flag=c.kagitabaBackupFlags?.[key];group.append(el('p',label,'muted'),el('p',flag===undefined?'Not recorded':flag===true?'Yes':flag===false?'No':'Invalid'));
+   }
+  }else group.append(el('p',c.type,'muted'));
+ }
+ for(const url of payload.entity.scope?.urls??[])root.append(el('p',url,'fingerprint'));
+ root.append(button('Edit entry',()=>{edit(payload,id,parent,draft);feedback();},true));
+}
 function newPayload(origin='') {const id=random(16);return {format:'kagitaba-cxf',version:1,cxfVersion:{major:1,minor:0},kind:'item',entity:{id:encode(id),title:'New login',credentials:[{type:'basic-auth',username:{fieldType:'string',value:''},password:{fieldType:'concealed-string',value:''}}],scope:{urls:origin?[origin]:[],androidApps:[]}}};}
 function edit(payload,id,parent,draft=null,captured=null) {
   parent.replaceChildren();const root=parent;
   root.classList.add('active');document.querySelector('.entries')?.setAttribute('hidden','');document.querySelector('.toolbar')?.setAttribute('hidden','');
   root.append(el('h3',id?'Edit entry':'New login'));root.addEventListener('input',()=>{dirty=true;});
   const title=field(root,'Title',payload.entity.title ?? '');
-  const basic=payload.entity.credentials?.find(c=>c.type==='basic-auth');
-  let username,password,urls;
-  if(basic){username=field(root,'Username',captured?.username??basic.username?.value??'');password=field(root,'Password',captured?.password??basic.password?.value??'','password');root.append(button('Show / hide password',()=>{password.type=password.type==='password'?'text':'password';}));urls=field(root,'Website URLs (one per line)',(payload.entity.scope?.urls??[]).join('\n'),'textarea');}
+  const logins=[];
+  for(const [index,basic] of (payload.entity.credentials??[]).entries()){
+    if(basic.type!=='basic-auth')continue;
+    const username=field(root,'Username',captured?.username??basic.username?.value??'','textarea');
+    const password=field(root,'Password',captured?.password??basic.password?.value??'','textarea');password.hidden=true;
+    root.append(button('Show / hide password',()=>{password.hidden=!password.hidden;}),button('Generate…',()=>generator(value=>{password.value=value;dirty=true;})));
+    logins.push({index,basic,username,password});
+  }
+  const urlRows=[];const urlsRoot=el('section',undefined,'url-table');urlsRoot.append(el('h4','URLs'));const urlBody=el('div');urlsRoot.append(urlBody);root.append(urlsRoot);
+  const addUrl=value=>{
+    const row=el('div',undefined,'url-row'),input=el('input');input.type='text';input.value=value;input.setAttribute('aria-label','URL');
+    const record={input,removed:false};urlRows.push(record);
+    const copy=button('Copy',()=>copySecret(input.value));copy.setAttribute('aria-label','Copy URL');
+    const remove=button('×',()=>{record.removed=true;row.remove();dirty=true;});remove.setAttribute('aria-label','Remove URL');
+    row.append(input,copy,remove);urlBody.append(row);
+  };
+  for(const value of payload.entity.scope?.urls??[])addUrl(value);
+  const addUrlButton=button('+ URL',()=>{addUrl('');dirty=true;});addUrlButton.classList.add('url-add');urlsRoot.append(addUrlButton);
+  const appended=[];
+  root.append(button('Add login',()=>{const c={type:'basic-auth',username:{fieldType:'string',value:''},password:{fieldType:'concealed-string',value:''}};appended.push(c);const username=field(root,'New username','','textarea'),password=field(root,'New password','','textarea');password.hidden=true;username.oninput=()=>c.username.value=username.value;password.oninput=()=>c.password.value=password.value;root.append(button('Show / hide password',()=>{password.hidden=!password.hidden;}),button('Generate…',()=>generator(v=>{password.value=v;c.password.value=v;dirty=true;})));dirty=true;}));
+  const notes=[];
+  for(const [index,c] of (payload.entity.credentials??[]).entries())if(c.type==='note'){
+    const input=field(root,'Note',c.content?.value??'','textarea');input.hidden=true;root.append(button('Show / hide note',()=>{input.hidden=!input.hidden;}));notes.push({index,c,input});
+  }
+  root.append(button('Add note',()=>{const c={type:'note',content:{fieldType:'string',value:''}};appended.push(c);const input=field(root,'New note','','textarea');input.oninput=()=>{c.content.value=input.value;dirty=true;};dirty=true;}));
+  const customFields=[];
+  for(const [index,c] of (payload.entity.credentials??[]).entries())if(c.type==='custom-fields'){
+    root.append(el('h4','Custom fields'));
+    for(const [fieldIndex,f] of (c.fields??[]).entries()){
+      const label=typeof f.label==='string'?f.label:'Unnamed field';
+      if(typeof f.value!=='string')continue;
+      if(f.fieldType==='boolean' && ['true','false'].includes(f.value)){
+        const input=check(root,label,f.value==='true');input.onchange=()=>{dirty=true;};customFields.push({index,fieldIndex,f,input,boolean:true});
+      }else if(['string','concealed-string'].includes(f.fieldType)){
+        const concealed=f.fieldType==='concealed-string'||label.trim().toLowerCase()==='pin';
+        const input=field(root,label,f.value,concealed?'password':'text');
+        if(concealed)root.append(button('Show / hide',()=>{input.type=input.type==='password'?'text':'password';}));
+        customFields.push({index,fieldIndex,f,input,boolean:false});
+      }else root.append(el('p',`${label} · ${f.fieldType??''}`,'muted'));
+    }
+  }
+  const totps=[];
+  for(const [index,c] of (payload.entity.credentials??[]).entries())if(c.type==='totp'){
+    const fields={};for(const name of ['secret','algorithm','period','digits','issuer','username'])fields[name]=field(root,`TOTP ${name}`,String(c[name]??''),name==='secret'?'password':'text');totps.push({index,c,fields});
+    root.append(button('Show current code',()=>totpCode(c)));
+  }
+  root.append(button('Import TOTP (camera / picture / URI)',()=>importTotp(c=>{appended.push(c);root.append(el('p',`TOTP ready to save · ${c.issuer??''} · ${c.username??''}`));dirty=true;})));
   if(captured)dirty=true;
   root.append(el('p',id?'Changes stay in the wallet; they do not change your password at the website.':'Only this installation receives access.','muted'));
   const advanced=el('details');advanced.append(el('summary','Advanced: CXF payload'));const json=field(advanced,'CXF envelope',draft?.payload??JSON.stringify(payload,null,2),'textarea');root.append(advanced);let rawChanged=false;json.oninput=()=>rawChanged=true;
@@ -82,7 +193,12 @@ function edit(payload,id,parent,draft=null,captured=null) {
     const entryId=id??hex(decode(payload.entity.id));
     const changes={};
     if(title.value!==payload.entity.title)changes.title=title.value;
-    if(basic){const login={};if(username.value!==(basic.username?.value??''))login.username=username.value;if(password.value!==(basic.password?.value??''))login.password=password.value;if(urls.value!==(payload.entity.scope?.urls??[]).join('\n'))login.urls=urls.value.split('\n').map(s=>s.trim()).filter(Boolean).map(value=>{const u=new URL(value);if(u.protocol!=='https:')throw Error('Use HTTPS website URLs');return value;});changes.login=login;}
+    changes.logins=logins.map(({index,basic,username,password})=>({index,...(username.value!==(basic.username?.value??'')?{username:username.value}:{}),...(password.value!==(basic.password?.value??'')?{password:password.value}:{})}));
+    const urls=urlRows.filter(r=>!r.removed).map(r=>r.input.value);if(JSON.stringify(urls)!==JSON.stringify(payload.entity.scope?.urls??[]))changes.urls=urls;
+    changes.appendCredentials=appended;
+    changes.customFields=customFields.map(({index,fieldIndex,f,input,boolean})=>({index,fieldIndex,value:boolean?String(input.checked):input.value,previous:f.value})).filter(p=>p.value!==p.previous).map(({previous,...patch})=>patch);
+    changes.notes=notes.filter(({c,input})=>input.value!==(c.content?.value??'')).map(({index,input})=>({index,value:input.value}));
+    changes.totps=totps.map(({index,c,fields})=>({index,...Object.fromEntries(Object.entries(fields).filter(([key,input])=>input.value!==String(c[key]??'')).map(([key,input])=>[key,input.value]))}));
     await send({type:'save',id:entryId,payload:json.value,expectedPrimary:draft?.primary??null,...(!rawChanged?{changes}:{})});
     dirty=false;selectedId=entryId;await render();feedback('Entry saved.','success');
   },true));
@@ -90,8 +206,9 @@ function edit(payload,id,parent,draft=null,captured=null) {
   if(id)root.append(button('Delete entry',async()=>{if(!confirm('Delete this entry? Signed history retains old revisions.'))return;await send({type:'delete',id});dirty=false;selectedId=null;await render();feedback('Entry deleted.','success');}));
 }
 function renderConnect() {
-  const enrollment=section('2 · Enroll in your wallet');enrollment.append(el('p','Import this request on your computer, grant entry access, then push.'),button('Export participant request',async()=>{download('kagitaba-participant.json',await send({type:'participant'}));feedback('Request exported.','success');}));
-  const node=section('3 · Connect repository');
+  if(view==='enrollment'){app.append(button('← Back',()=>navigate('wallet')));const enrollment=section('Create enrollment request');enrollment.append(button('Export participant request',async()=>{download('kagitaba-participant.json',await send({type:'participant'}));feedback('Request exported.','success');},true));return;}
+  app.append(button('Create enrollment request',()=>navigate('enrollment')));
+  const node=section('Open wallet');
   const url=field(node,'HTTPS Git remote URL',connectionDraft.url??''),username=field(node,'Remote username',connectionDraft.username??''),password=field(node,'Remote token / password',connectionDraft.password??'','password');
   url.placeholder='https://github.com/you/wallet.git';username.autocomplete='username';password.autocomplete='off';
   const remember=check(node,'Remember credentials, encrypted on this installation',connectionDraft.remember??true),auto=check(node,'Automatically synchronize after unlocking and saving',connectionDraft.autoSync??true);
@@ -104,7 +221,6 @@ function renderConnect() {
   const file=field(offline,'Signed transfer','','file');file.accept='.json';offline.append(button('Import transfer',async()=>{if(!file.files[0]||file.files[0].size>512*1024*1024)throw new Error('Select a bounded transfer file');const bundle=JSON.parse(await file.files[0].text());if(!/^[0-9a-f]{40}$/.test(checkpoint.value))throw new Error('Enter the independently verified checkpoint');await send({type:'import',bundle:bundle.wallet??bundle,trust:{root:root.value,checkpoint:checkpoint.value}});await render();}));
 }
 async function synchronize(){if(!canLeave())return;if(!state.unlocked)await unlock();feedback('Fetching and verifying wallet updates…','progress');const result=await send({type:'sync'});await render();feedback(result.warning??(result.outcome==='pulled'?'Downloaded and verified wallet updates.':result.outcome==='pushed'?'Your saved changes are synchronized.':'Wallet is up to date.'),result.warning?'info':'success');}
-function renderSyncBar(){const bar=el('div',undefined,'syncbar'),summary=el('div'),status=state.replica.lastSync,pending=state.replica.synced!==state.replica.head;summary.append(el('strong',status?.error?'Synchronization needs attention':pending?'Changes saved on this device':'Wallet synchronized'));summary.append(el('div',status?.error??(state.replica.syncedAt?`Last sync: ${new Date(state.replica.syncedAt).toLocaleString()}`:pending?'Synchronize to back up your changes.':'Ready to use.'),'muted'));bar.append(summary);if(state.replica.remote)bar.append(button(state.unlocked?'Synchronize':'Unlock & synchronize',synchronize,true));else bar.append(button('Set up synchronization',()=>navigate('settings')));app.append(bar);}
 function renderSync() {
   if(view==='settings'){
     const node=section('Settings'),actions=el('div',undefined,'workflow-actions');
@@ -144,18 +260,29 @@ async function renderWebsite() {
 }
 async function renderRequest() {
   const request=await send({type:'request',requestId});const node=section(request.kind==='create'?'Create a passkey':'Use a passkey');
-  node.append(el('p',request.origin),el('p',`Relying party: ${request.rpId}`,'fingerprint'));
+  node.append(el('p',request.origin,'request-origin'),el('p',`Relying party: ${request.rpId}`,'fingerprint'));
   if(!state.unlocked)node.append(button('Unlock wallet',unlock,true));
-  else if(request.kind==='create'){node.append(el('p',`Account: ${request.username}`));node.append(button('Verify with security key and create',async()=>{const proof=await assertion(state.installation.unlock);await send({type:'approve',requestId,...proof});requestFinished=true;app.replaceChildren(el('h2','Passkey created'),el('p','Return to the website to continue.'));feedback('Passkey created successfully.','success');},true));}
+  else if(request.kind==='create'){node.append(el('p','Account','field-caption'),el('p',request.username,'credential-value'));node.append(button('Verify with security key and create',async()=>{const proof=await assertion(state.installation.unlock);await send({type:'approve',requestId,...proof});requestFinished=true;app.replaceChildren(el('h2','Passkey created'),el('p','Return to the website to continue.'));feedback('Passkey created successfully.','success');},true));}
   else {if(!request.accounts.length)node.append(el('p','No accessible passkey matches this request. Use Firefox or another authenticator below.'));for(const account of request.accounts)node.append(button(`Verify and use ${account.title}`,async()=>{const proof=await assertion(state.installation.unlock);await send({type:'approve',requestId,entryId:account.entryId,credentialId:account.credentialId,...proof});requestFinished=true;app.replaceChildren(el('h2','Response sent'),el('p','Return to the website to continue.'));feedback('Signed response sent to the website.','success');},true));}
   node.append(button('Use Firefox / another authenticator',async()=>{await send({type:'approve',requestId,fallback:true});window.close();}));
 }
+document.querySelector('#close').onclick=async()=>{if(!canLeave())return;try{await send({type:'lock'});window.close();}catch{feedback('Unable to lock wallet.','error');}};
 document.querySelector('#lock').onclick=async()=>{try{await send({type:'lock'});}catch{feedback('Unable to lock wallet.','error');}};
 browser.runtime.onMessage.addListener(message=>{
   if(message.type==='active-site'&&!requestId&&!dirty&&!busy){tabId=message.tabId;selectedId=null;render().catch(()=>{});}
-  if(message.type==='locked'){fidoPending?.abort();if(message.reason!=='connect'){connectionDraft.password='';settingsDraft.password='';}uiEpoch++;renderVersion++;dirty=false;selectedId=null;app.replaceChildren();document.querySelectorAll('dialog').forEach(dialog=>dialog.remove());render().catch(()=>{});feedback('Wallet locked.');}
+  if(message.type==='locked'){fidoPending?.abort();if(message.reason!=='connect'){connectionDraft.password='';settingsDraft.password='';}closeTools();selectedCollection=null;uiEpoch++;renderVersion++;dirty=false;selectedId=null;app.replaceChildren();document.querySelectorAll('dialog').forEach(dialog=>dialog.remove());render().catch(()=>{});feedback('Wallet locked.');}
   if(message.type==='sync-progress'){const phases={fetching:'Fetching wallet updates…',verifying:'Verifying signed wallet history…',pushing:'Uploading encrypted changes…'};if(phases[message.phase]&&!busy)feedback(phases[message.phase],'progress');}
   if(message.type==='sync-result'&&!busy){feedback(message.error??message.warning??(message.outcome==='pulled'?'Downloaded and verified wallet updates.':message.outcome==='pushed'?'Your saved changes are synchronized.':'Wallet is up to date.'),message.error?'error':message.warning?'info':'success');if(!dirty)render().catch(()=>{});}
 });
 window.addEventListener('beforeunload',event=>{if(dirty){event.preventDefault();event.returnValue='';}});
 render().catch(error=>feedback(error.message,'error'));
+
+function keepCollectionVisible() {
+  const tree=document.querySelector('.collection-tree'),active=tree?.querySelector('[aria-current=true]');
+  if(!active)return;
+  const container=tree.getBoundingClientRect(),row=active.getBoundingClientRect();
+  if(row.bottom>container.bottom)tree.scrollTop+=row.bottom-container.bottom;
+  else if(row.top<container.top)tree.scrollTop-=container.top-row.top;
+}
+window.addEventListener('resize',()=>requestAnimationFrame(keepCollectionVisible));
+new ResizeObserver(keepCollectionVisible).observe(document.documentElement);

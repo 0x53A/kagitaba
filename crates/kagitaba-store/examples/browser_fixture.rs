@@ -41,6 +41,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Snapshot::empty(enc, key.public.clone())?,
         &key,
     )?;
+    if std::env::args().nth(3).as_deref() == Some("--attachment") {
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([42; 32]);
+        let id = EntryId::from_bytes([7; 16]);
+        let payload = kagitaba_cxf::Payload::from_json(id, br#"{"format":"kagitaba-cxf","version":1,"cxfVersion":{"major":1,"minor":0},"kind":"item","entity":{"id":"BwcHBwcHBwcHBwcHBwcHBw","title":"Synthetic attached item","credentials":[]}}"#)?;
+        let (payload, blobs) = kagitaba_cxf::attachments::add(&payload, "synthetic.bin", &vec![17; 17 * 1024 * 1024], &mut rng)?;
+        let recipients = store.snapshot.wallet.participants().values().cloned().collect::<Vec<_>>();
+        let mut next = store.snapshot.clone();
+        next.wallet = next.wallet.with_entry(payload.seal(&recipients, &mut rng)?)?;
+        next.attachments.insert(id, blobs.iter().map(|(id, chunks)| Ok((id.clone(), kagitaba_store::AttachmentBlob::from_chunks(chunks)?))).collect::<kagitaba_store::Result<_>>()?);
+        store.save(next, &key, "Synthetic attachment")?;
+    }
     if std::env::args().nth(3).as_deref() == Some("--merge") {
         let peer_path = dir.path().join("peer");
         store.backup_to(&peer_path)?;

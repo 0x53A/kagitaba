@@ -20,8 +20,9 @@ fixed strings including explicit remaining-PIN-attempt messages. Only the
 foreground UI opens sessions. Existing software identity APIs are retained but
 the Android application no longer selects them. Store operations accept a shared
 Signer interface; PIV ECDH opens existing CXF grants and PIV ECDSA signs commits.
-Git tokens are Rust-encrypted and wrapped to the hardware recipient using a
-separate, versioned application-owned local envelope (see android/AGENTS.md).
+Legacy local-envelope JNI APIs remain for compatibility. The Android app now
+stores Git tokens with installation-owned Android Keystore protection and does
+not call PIV local encryption/decryption for them (see android/AGENTS.md).
 
 The same bridge supports PIN-free `inspect` (verified wallet candidates) and
 `inspect_slots` (new-wallet provisioning). Match actual encryption AND signing
@@ -67,3 +68,24 @@ must be kept aligned, and raw native/Git errors must never be exposed.
 Use synthetic native tests to verify interoperability, tampering, unauthorized
 signers and rollback. Keep all passkey cryptographic operations in the portable
 adapter rather than creating a second Android-only format or implementation.
+
+Immutable owned attachments use the shared store reader and merge/revision rules.
+Returned entries include `hasAttachments`; Kotlin validates owned manifests against
+the decrypted current payload with `validate_attachment_edit` before ordinary saves.
+Store saves retain attachment maps, reject recipient reductions when attached, and
+store deletion removes the owner's attachment tree. No authoring/download UI is
+introduced. JNI request JSON is bounded to 768 MiB for encoded transfers; processing
+still makes in-memory copies. Android's manual transfer picker retains its existing
+64 MiB input limit. Physical/provider operations and remote sync use shared readers.
+Shared store snapshots retain lazy Git attachment references; opening the native
+repository does not materialize attachment ciphertext. Explicit attachment reads
+use pure Rust bounded-buffer disk streams, including packed Git delta chains.
+Snapshot acceptance checks blob path/size and revision rules; container validation
+and plaintext authentication are deferred to explicit file access. JSON transfers
+and browser-facing base64 snapshots still allocate encoded copies.
+
+`store_catalog` uses shared `Index::refresh_for_listing` to retain complete
+transient summaries when valid payloads exceed persisted cache bounds. Only
+successfully sealed indexes are written. Oversized listings leave the head,
+existing cache and wrapper unchanged and require no signing. Trust, decryption
+and signing failures retain their normal error behavior.

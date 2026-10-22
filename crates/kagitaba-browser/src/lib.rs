@@ -181,7 +181,7 @@ pub async fn command(
 
 /// Native-testable implementation of the same boundary as [`command`].
 pub async fn execute(request_json: &str, random_bytes: Vec<u8>) -> Result<String> {
-    if request_json.len() > 96 * 1024 * 1024 || random_bytes.len() > 1024 * 1024 {
+    if request_json.len() > 768 * 1024 * 1024 || random_bytes.len() > 1024 * 1024 {
         return Err(Error);
     }
     let request = SecretJson(serde_json::from_str(request_json).map_err(|_| Error)?);
@@ -195,7 +195,34 @@ pub async fn execute(request_json: &str, random_bytes: Vec<u8>) -> Result<String
 
 async fn dispatch(request: &Value, random: &mut Random) -> Result<Value> {
     match string(request, "op")? {
+        "password_generate" => {
+            let rules: kagitaba_cxf::password::Rules=serde_json::from_value(request["rules"].clone()).map_err(|_|Error)?;
+            let alphabet=rules.alphabet().map_err(|_|Error)?;
+            let password=rules.generate(random).map_err(|_|Error)?;
+            Ok(json!({"password":password.as_str(),"alphabet":alphabet}))
+        }
+        "totp_parse" => Ok(json!({"credential":kagitaba_cxf::otp::parse(string(request,"uri")?).map_err(|_|Error)?})),
+        "totp_code" => {
+            let (code,remaining)=kagitaba_cxf::otp::code(&request["credential"],request["now"].as_u64().ok_or(Error)?).map_err(|_|Error)?;
+            Ok(json!({"code":code.as_str(),"remaining":remaining}))
+        }
+        "qr_scan" => {
+            let pixels=binary(request,"pixels")?;
+            let values=kagitaba_cxf::otp::scan(request["width"].as_u64().ok_or(Error)? as usize,request["height"].as_u64().ok_or(Error)? as usize,&pixels).map_err(|_|Error)?;
+            Ok(json!({"uris":values.iter().map(|s|s.as_str()).collect::<Vec<_>>()}))
+        }
         "payload_edit" => edit::operation(request),
+        "validate_attachment_edit" => {
+            let id = string(request, "entryId")?.parse().map_err(|_| Error)?;
+            let new = Payload::from_json(id, string(request, "payload")?.as_bytes()).map_err(|_| Error)?;
+            if let Some(old) = request.get("previousPayload").filter(|v| !v.is_null()) {
+                let old = Payload::from_json(id, old.as_str().ok_or(Error)?.as_bytes()).map_err(|_| Error)?;
+                kagitaba_cxf::attachments::validate_edit(&old, &new).map_err(|_| Error)?;
+            } else if !kagitaba_cxf::attachments::list(&new).map_err(|_| Error)?.is_empty() {
+                return Err(Error);
+            }
+            Ok(json!({"valid":true}))
+        }
         "identity_generate" => Identity {
             agreement: p256::SecretKey::try_generate_from_rng(random).map_err(|_| Error)?,
             signing: p256::SecretKey::try_generate_from_rng(random).map_err(|_| Error)?,

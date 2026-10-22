@@ -16,7 +16,7 @@ class AutofillActivity : SecureActivity() {
         val form = ticket?.entryId?.let { AutofillRequests.take(it) }
         screen("Password autofill")
         label((application as KagitabaApp).wallets.name(vault.walletId))
-        if (form == null) { label("Request expired. Return to the login form and try again."); button("Close") { finish() }; return }
+        if (form == null) { label("Request expired. Return to the login form and try again.", 14); button("Close") { finish() }; return }
         label(form.origin ?: form.packageName, 22)
         button("Unlock to continue", primary = true) { authenticate { work("Opening wallet…") {
             require(CallerPolicy(this).packageCertificates(form.packageName) == form.certificates)
@@ -24,7 +24,7 @@ class AutofillActivity : SecureActivity() {
                 screen("Save password"); label(form.origin ?: form.packageName, 22)
                 val title = field("Title", form.origin ?: form.packageName)
                 val username = field("Username", form.username)
-                label("The password from the login form will be encrypted in your wallet.")
+                label("The password from the login form will be encrypted in your wallet.", 14)
                 button("Save password", primary = true) { work("Saving…") {
                     val item = WalletItem.create(title.text.toString(), WalletItem.password(username.text.toString(), form.password), form.origin)
                     if (form.origin == null) item.bindApp(form.packageName, form.certificates)
@@ -35,9 +35,9 @@ class AutofillActivity : SecureActivity() {
                 val matches = passwords.filter { if (form.origin != null) it.matches(form.origin) else it.matchesApp(form.packageName, form.certificates) }
                 screen("Choose a password"); label(form.origin ?: form.packageName, 22)
                 for (item in matches) button(item.title) { fill(form, item) }
-                if (matches.isEmpty()) label("No matching passwords. Save a login for this website or link an entry to this app.")
+                if (matches.isEmpty()) label("No matching passwords. Save a login for this website or link an entry to this app.", 14)
                 if (form.origin == null) button("Link an existing password to this app") {
-                    screen("Link a password"); label("Only choose an account you intend to share with ${form.packageName}.")
+                    screen("Link a password"); label("Only choose an account you intend to share with ${form.packageName}.", 14)
                     for (item in passwords) button(item.title) {
                         AlertDialog.Builder(this).setTitle("Allow ${form.packageName}?")
                             .setMessage("Share ${item.title} with this app and remember its signing certificate?")

@@ -7,7 +7,7 @@ publish = false
 
 [workspace]
 members = ["crates/kagitaba-app", "crates/kagitaba-android", "crates/kagitaba-browser", "crates/kagitaba-cxf", "crates/kagitaba-device", "crates/kagitaba-store"]
-default-members = [".", "crates/kagitaba-cxf"]
+default-members = ["crates/kagitaba-app"]
 resolver = "3"
 
 [dependencies]

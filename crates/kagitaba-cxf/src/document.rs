@@ -72,7 +72,7 @@ fn validate(value: &Value) -> Result<()> {
         return Err(Error::UnsupportedVersion);
     }
     // Library models cover all current credential kinds, plus unknown kinds.
-    model::Header::<Value>::deserialize(value).map_err(|_| Error::InvalidDocument)?;
+    model::Header::<Value>::deserialize(&crate::otp::validation_view(value)?.0).map_err(|_| Error::InvalidDocument)?;
     let mut accounts = BTreeSet::new();
     for account in json::array(value, "accounts")? {
         json::register(account, &mut accounts)?;
@@ -98,7 +98,7 @@ pub(crate) fn validate_link(value: &Value) -> Result<()> {
 }
 
 pub(crate) fn validate_item(value: &Value) -> Result<()> {
-    model::Item::<Value>::deserialize(value).map_err(|_| Error::InvalidDocument)?;
+    model::Item::<Value>::deserialize(&crate::otp::validation_view(value)?.0).map_err(|_| Error::InvalidDocument)?;
     json::id(&value["id"])?;
     for credential in json::array(value, "credentials")? {
         // Parse these directly: serde's forward-compatible Unknown fallback must
@@ -121,7 +121,7 @@ pub(crate) fn validate_item(value: &Value) -> Result<()> {
                     .map_err(|_| Error::InvalidDocument)?;
             }
             "totp" => {
-                model::TotpCredential::deserialize(credential)
+                model::TotpCredential::deserialize(&crate::otp::validation_view(credential)?.0)
                     .map_err(|_| Error::InvalidDocument)?;
                 let s = credential["secret"]
                     .as_str()

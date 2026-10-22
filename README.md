@@ -51,3 +51,33 @@ If you edit an entry, only the file(s) of that entry are modified. Concurrent ed
 Bitwarden / Vaultwarden, LastPass all use a web backend with entries in a database like sqlite or postgre. DB breaks? Server is offline? you're fucked. (well, the database is cached locally, but copying entries between devices without the server is gonna be hard.)
 
 KeePass has limited support for hardware keys. You can unlock one database with multiple keys by basically cloning them - enrolling the same `hmac` secret into all of them. This only protects the whole database, you can not control access to individual entries inside one database.
+## Firefox through the native client
+
+Firefox can use the Linux wallet without enrolling the extension as a separate
+participant. Build the app and extension, then register the native host:
+
+```sh
+nix-shell --run 'cargo build -p kagitaba-app'
+nix-shell --run 'uv run --no-project tools/build_firefox.py'
+uv run --no-project tools/install_native_host.py "$PWD/target/debug/kagitaba-app"
+```
+
+For permanent installation in standard Firefox, use a Mozilla-signed XPI via
+**Add-ons → gear menu → Install Add-on From File**. The local build above is
+unsigned; signing is a separate unlisted AMO submission. The native host must
+still be registered separately.
+
+For temporary development installation, load `extension/firefox/dist/manifest.json` through Firefox's
+`about:debugging#/runtime/this-firefox` (Load Temporary Add-on). Open and unlock
+the native wallet. On an HTTPS login page, open Kagitaba from the Firefox toolbar,
+select **Use native client**, then **Choose login in native client**. Select the
+entry and approve the displayed origin in the native window. Its saved website
+scope must match the page's exact HTTPS origin. The form is filled without submission.
+
+The gateway uses a private Unix socket under `$XDG_RUNTIME_DIR/kagitaba`.
+It supports password filling and ES256 passkey registration/sign-in. Website
+passkey requests open the native approval window; find/select a matching account
+for sign-in, then verify your PIV PIN. Registration saves the encrypted passkey
+before reporting success. **Use standalone wallet** switches back to the independent
+browser participant. See [native gateway details](crates/kagitaba-app/AGENTS.md#firefox-native-gateway)
+for the protocol, security boundary and validation limits.

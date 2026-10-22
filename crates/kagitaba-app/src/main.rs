@@ -1,11 +1,22 @@
 #![forbid(unsafe_code)]
+mod credential_tools;
 mod backend;
 mod editor;
+mod gateway;
+mod gateway_passkey;
 mod preferences;
 mod remote;
 mod theme;
 mod ui;
 fn main() -> eframe::Result {
+    if std::env::args().nth(1).as_deref() == Some("--native-messaging")
+        || std::env::args_os().len() == 3
+    {
+        if gateway::bridge().is_err() {
+            eprintln!("Kagitaba native gateway unavailable");
+        }
+        return Ok(());
+    }
     let window_size = [1180.0, 820.0];
     #[cfg(feature = "smoke")]
     let window_size = if std::env::var_os("KAGITABA_SMOKE_NARROW").is_some() {

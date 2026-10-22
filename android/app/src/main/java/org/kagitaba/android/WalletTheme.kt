@@ -9,6 +9,7 @@ import android.graphics.drawable.StateListDrawable
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.TextView
 
 /** Shared roles with the native and Firefox themes; Android keeps 48dp targets. */
 object WalletTheme {
@@ -33,16 +34,37 @@ object WalletTheme {
             addState(intArrayOf(-android.R.attr.state_enabled), box(context, card))
             addState(intArrayOf(android.R.attr.state_pressed), box(context, line, accent))
             addState(intArrayOf(android.R.attr.state_focused), box(context, card, accent))
+            addState(intArrayOf(android.R.attr.state_hovered), box(context, line, accent))
             addState(intArrayOf(), box(context, if (primary) accent else card, if (primary) accent else line))
         }
         setTextColor(ColorStateList(
-            arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf(android.R.attr.state_pressed), intArrayOf(android.R.attr.state_focused), intArrayOf()),
-            intArrayOf(muted, ink, ink, if (primary) WalletTheme.background else ink)))
+            arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf(android.R.attr.state_pressed), intArrayOf(android.R.attr.state_focused), intArrayOf(android.R.attr.state_hovered), intArrayOf()),
+            intArrayOf(muted, ink, ink, ink, if (primary) WalletTheme.background else ink)))
         elevation = 0f; stateListAnimator = null
         layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(context, 8) }
     }
+    fun caption(view: TextView) = with(view) {
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        textSize = 13f; setTextColor(muted)
+        setPadding(0, dp(context, 14), 0, dp(context, 6))
+    }
+    fun heading(view: TextView, size: Float = 19f) = with(view) {
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        textSize = size; setTextColor(ink)
+    }
+    fun persistentScrollbar(view: android.view.View) = with(view) {
+        // Programmatically enabling scrolling alone can leave Android's internal
+        // ScrollBarDrawable null (notably EditText with a no-scrollbar theme).
+        // Set a thumb first to initialize it before disabling fading.
+        verticalScrollbarThumbDrawable = android.graphics.drawable.ColorDrawable(muted)
+        isVerticalScrollBarEnabled = true; isScrollbarFadingEnabled = false
+        scrollBarStyle = android.view.View.SCROLLBARS_INSIDE_INSET
+    }
+    fun dataFont(context: Context): Typeface = Typeface.createFromAsset(context.assets, "fonts/DejaVuSansMono.ttf")
     fun field(view: EditText) = with(view) {
+        typeface = dataFont(context); fontFeatureSettings = "liga=0,calt=0"
         textSize = 16f; setTextColor(ink); setHintTextColor(muted)
+        if (!isSingleLine) persistentScrollbar(this)
         backgroundTintList = null
         background = StateListDrawable().apply {
             addState(intArrayOf(android.R.attr.state_focused), box(context, WalletTheme.background, accent))

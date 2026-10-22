@@ -1,3 +1,4 @@
+use crate::theme;
 use eframe::egui;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -68,60 +69,130 @@ fn wipe(v: &mut Value) {
         _ => {}
     }
 }
-pub fn show(ui: &mut egui::Ui, json: &mut String, clipboard: &mut Clipboard) -> Option<String> {
+fn passkey_algorithm(value: &Value) -> &'static str {
+    use base64::Engine;
+    use p256::pkcs8::DecodePrivateKey;
+    let Some(encoded) = value["key"].as_str() else { return "Unknown"; };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded.trim_end_matches('=')) else { return "Unknown"; };
+    let bytes = Zeroizing::new(bytes);
+    if p256::SecretKey::from_pkcs8_der(&bytes).is_ok() { "ES256 / P-256" } else { "Unknown" }
+}
+
+fn passkey_details(ui: &mut egui::Ui, value: &Value, clipboard: &mut Clipboard, status: &mut Option<String>) {
+    for (label, key, secret) in [
+        ("Relying party", "rpId", false), ("Username", "username", false),
+        ("Display name", "userDisplayName", false), ("Credential ID", "credentialId", false),
+        ("User handle", "userHandle", true),
+    ] {
+        let Some(text) = value[key].as_str().filter(|v| !v.is_empty()) else { continue; };
+        theme::caption(ui, label);
+        let id = ui.id().with(("passkey-detail", key));
+        let mut revealed = ui.data(|d| d.get_temp::<bool>(id).unwrap_or(false));
+        ui.horizontal_wrapped(|ui| {
+            if secret && !revealed { ui.label("••••••••"); }
+            else { ui.add(egui::Label::new(egui::RichText::new(text).monospace()).selectable(true).wrap()); }
+            if secret && ui.small_button(if revealed { "Hide" } else { "Show" }).clicked() { revealed = !revealed; }
+            if ui.small_button("Copy").clicked() {
+                *status = Some(if clipboard.copy(text) { "Copied; clears in 30 seconds" } else { "Clipboard unavailable" }.into());
+            }
+        });
+        ui.data_mut(|d| d.insert_temp(id, revealed));
+    }
+    theme::caption(ui, "Algorithm"); ui.label(passkey_algorithm(value));
+    for (label, key) in [("Backup eligible", "eligible"), ("Backed up", "state")] {
+        theme::caption(ui, label);
+        ui.label(match value["kagitabaBackupFlags"].get(key) {
+            None => "Not recorded", Some(Value::Bool(true)) => "Yes", Some(Value::Bool(false)) => "No", Some(_) => "Invalid",
+        });
+    }
+}
+
+pub fn show(
+    ui: &mut egui::Ui,
+    json: &mut String,
+    clipboard: &mut Clipboard,
+    tools: &mut crate::credential_tools::Tools,
+) -> Option<String> {
     let Ok(value) = serde_json::from_str::<Value>(json) else {
-        ui.label("Invalid JSON; fix it in the complete payload editor.");
+        ui.colored_label(
+            theme::ERROR,
+            "Invalid JSON; fix it in the complete payload editor.",
+        );
         return None;
     };
     let mut v = SecretValue(value);
     let mut changed = false;
     let mut status = None;
+    let is_item = v.0["kind"] == "item";
     let Some(entity) = v.0.get_mut("entity").filter(|e| e.is_object()) else {
-        ui.label("Missing entry object; fix the complete payload.");
+        ui.colored_label(
+            theme::ERROR,
+            "Missing entry object; fix the complete payload.",
+        );
         return None;
     };
     if let Some(title) = entity.get_mut("title") {
         changed |= field(ui, "Title", title, false, clipboard, &mut status);
     }
-    if let Some(urls) = entity
-        .get_mut("scope")
-        .and_then(|s| s.get_mut("urls"))
-        .and_then(Value::as_array_mut)
-    {
-        for (i, url) in urls.iter_mut().enumerate() {
-            ui.push_id(("url", i), |ui| {
-                changed |= field(ui, "URL", url, false, clipboard, &mut status);
-            });
+    if is_item {
+        let mut urls = SecretValue(entity.pointer("/scope/urls").cloned().unwrap_or_else(|| Value::Array(vec![])));
+        if let Some(rows) = urls.0.as_array_mut()
+            && url_table(ui, rows, clipboard, &mut status) {
+            let scope = entity.as_object_mut().unwrap().entry("scope").or_insert_with(|| serde_json::json!({"androidApps":[]}));
+            scope["urls"] = std::mem::take(&mut urls.0);
+            changed = true;
         }
     }
     if let Some(credentials) = entity.get_mut("credentials").and_then(Value::as_array_mut) {
         for (i, c) in credentials.iter_mut().enumerate() {
             ui.push_id(i, |ui| match c["type"].as_str().unwrap_or("") {
                 "basic-auth" => {
+                    theme::section(ui, "Login");
+                    for (name, kind) in [("username", "string"), ("password", "concealed-string")] {
+                        if c.get(name).is_none_or(Value::is_null)
+                            && ui.button(format!("Add {name}")).clicked()
+                        {
+                            c[name] = serde_json::json!({"fieldType":kind,"value":""});
+                            changed = true;
+                        }
+                    }
                     if let Some(value) = c.pointer_mut("/username/value") {
                         changed |= field(ui, "Username", value, false, clipboard, &mut status);
                     }
+                    if ui.button("Generate…").clicked() {
+                        tools.open_generator(Some(i));
+                    }
                     if let Some(value) = c.pointer_mut("/password/value") {
                         changed |= field(ui, "Password", value, true, clipboard, &mut status);
-                        if ui.button("Generate password (24 characters)").clicked() {
-                            match password() {
-                                Ok(new) => {
-                                    wipe(value);
-                                    *value = new.into();
-                                    changed = true;
-                                }
-                                Err(e) => status = Some(e.into()),
-                            }
+                    }
+                }
+                "custom-fields" => {
+                    theme::section(ui, "Custom fields");
+                    if let Some(fields) = c.get_mut("fields").and_then(Value::as_array_mut) {
+                        for (index, custom) in fields.iter_mut().enumerate() {
+                            ui.push_id(("custom", index), |ui| {
+                                changed |= custom_field(ui, custom, clipboard, &mut status);
+                            });
                         }
                     }
                 }
                 "note" => {
+                    ui.separator();
                     if let Some(value) = c.pointer_mut("/content/value") {
                         changed |= field(ui, "Note", value, true, clipboard, &mut status);
                     }
                 }
                 "totp" => {
+                    theme::section(ui, "One-time password");
                     ui.collapsing("TOTP settings", |ui| {
+                        for name in ["issuer", "username"] {
+                            if let Some(v) = c.get_mut(name) {
+                                changed |= field(ui, name, v, false, clipboard, &mut status);
+                            } else if ui.button(format!("Add TOTP {name}")).clicked() {
+                                c[name] = "".into();
+                                changed = true;
+                            }
+                        }
                         if let Some(secret) = c.get_mut("secret") {
                             changed |=
                                 field(ui, "Base32 secret", secret, true, clipboard, &mut status);
@@ -144,12 +215,16 @@ pub fn show(ui: &mut egui::Ui, json: &mut String, clipboard: &mut Clipboard) -> 
                                 changed = true;
                             }
                         }
-                        for (name, range) in [("digits", 6..=8), ("period", 1..=300)] {
+                        for name in ["digits", "period"] {
                             if let Some(mut number) = c[name].as_u64() {
                                 ui.horizontal(|ui| {
-                                    ui.label(name);
+                                    theme::caption(ui, name);
                                     if ui
-                                        .add(egui::DragValue::new(&mut number).range(range))
+                                        .add(
+                                            egui::DragValue::new(&mut number)
+                                                .range(1..=u64::MAX)
+                                                .clamp_existing_to_range(false),
+                                        )
                                         .changed()
                                     {
                                         c[name] = number.into();
@@ -166,8 +241,13 @@ pub fn show(ui: &mut egui::Ui, json: &mut String, clipboard: &mut Clipboard) -> 
                     match totp(c, now) {
                         Ok((code, remaining)) => {
                             ui.horizontal(|ui| {
-                                ui.monospace(code.as_str());
-                                ui.label(format!("{remaining}s"));
+                                ui.label(
+                                    egui::RichText::new(code.as_str())
+                                        .monospace()
+                                        .size(24.0)
+                                        .color(theme::AQUA),
+                                );
+                                theme::caption(ui, format!("{remaining}s"));
                                 if ui.button("Copy code").clicked() {
                                     status = Some(
                                         if clipboard.copy(&code) {
@@ -181,25 +261,25 @@ pub fn show(ui: &mut egui::Ui, json: &mut String, clipboard: &mut Clipboard) -> 
                             });
                         }
                         Err(e) => {
-                            ui.label(e);
+                            ui.colored_label(theme::ERROR, e);
                         }
                     }
                 }
                 "passkey" => {
-                    ui.label(format!(
-                        "Passkey for {}",
-                        c["rpId"].as_str().unwrap_or("unknown relying party")
-                    ));
-                    ui.label("Stored securely. Browser authentication is not yet implemented.");
+                    theme::section(ui, "Passkey");
+                    passkey_details(ui, c, clipboard, &mut status);
                 }
+                "file" if c.get("kagitabaFile").is_some() => {}
                 _ => {
-                    ui.label("Additional credential retained; inspect the complete payload below.");
+                    theme::caption(ui, "Additional credential retained in complete payload.");
                 }
             });
         }
     }
     if let Some(credentials) = entity.get_mut("credentials").and_then(Value::as_array_mut) {
-        ui.horizontal(|ui|{
+        ui.horizontal_wrapped(|ui|{
+            if ui.button("Import TOTP (camera / picture / URI)").clicked(){tools.totp=true;}
+            if ui.button("Add login").clicked(){credentials.push(serde_json::json!({"type":"basic-auth","username":{"fieldType":"string","value":""},"password":{"fieldType":"concealed-string","value":""}}));changed=true;}
             if ui.button("Add TOTP").clicked(){credentials.push(serde_json::json!({"type":"totp","secret":"","algorithm":"sha1","period":30,"digits":6}));changed=true;}
             if ui.button("Add note").clicked(){credentials.push(serde_json::json!({"type":"note","content":{"fieldType":"string","value":""}}));changed=true;}
         });
@@ -226,7 +306,10 @@ pub fn show(ui: &mut egui::Ui, json: &mut String, clipboard: &mut Clipboard) -> 
                 link["item"].as_str().unwrap_or("unknown")
             ));
         }
-        ui.label("Use the complete payload editor to change links and nested collections.");
+        theme::caption(
+            ui,
+            "Edit links and nested collections in the complete payload.",
+        );
     }
     if changed && let Ok(updated) = serde_json::to_string_pretty(&v.0) {
         json.zeroize();
@@ -234,6 +317,69 @@ pub fn show(ui: &mut egui::Ui, json: &mut String, clipboard: &mut Clipboard) -> 
     }
     status
 }
+fn url_table(ui: &mut egui::Ui, urls: &mut Vec<Value>, clipboard: &mut Clipboard, status: &mut Option<String>) -> bool {
+    theme::section(ui, "URLs");
+    let mut changed = false;
+    let mut remove = None;
+    if !urls.is_empty() {
+        egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::MUTED)).inner_margin(4.0).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            let input_width = (ui.available_width() - 96.0 - 2.0 * ui.spacing().item_spacing.x - 8.0).max(1.0);
+            for (index, value) in urls.iter_mut().enumerate() {
+                ui.push_id(("url", index), |ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(text) = value.as_str() {
+                            let mut edited = Zeroizing::new(text.to_owned());
+                            let response = ui.add_sized([input_width, 36.0], egui::TextEdit::singleline(&mut *edited)
+                                .font(egui::TextStyle::Monospace).vertical_align(egui::Align::Center).hint_text("URL"));
+                            if response.changed() {
+                                wipe(value);
+                                *value = Value::String(edited.to_string());
+                                changed = true;
+                            }
+                            if ui.add_sized([60.0, 36.0], egui::Button::new("Copy")).clicked() {
+                                *status = Some(if clipboard.copy(&edited) { "Copied; clears in 30 seconds. Clipboard history may retain copies." } else { "Clipboard unavailable" }.into());
+                            }
+                        }
+                        if ui.add_sized([36.0, 36.0], egui::Button::new(egui::RichText::new("×").color(theme::ERROR)))
+                            .on_hover_text("Remove URL").clicked() { remove = Some(index); }
+                    });
+                });
+            }
+        });
+    }
+    if let Some(index) = remove { let mut removed = urls.remove(index); wipe(&mut removed); changed = true; }
+    let response = ui.add_sized([ui.available_width(), 36.0], egui::Button::new("+ URL").frame(false));
+    let rect = response.rect.shrink(0.5);
+    let color = if response.hovered() || response.has_focus() { theme::AQUA } else { theme::MUTED };
+    ui.painter().extend(egui::Shape::dashed_line(&[rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()], egui::Stroke::new(1.0, color), 5.0, 4.0));
+    if response.clicked() { urls.push(Value::String(String::new())); changed = true; }
+    changed
+}
+
+fn custom_field(ui: &mut egui::Ui, custom: &mut Value, clipboard: &mut Clipboard, status: &mut Option<String>) -> bool {
+    let label = Zeroizing::new(custom["label"].as_str().unwrap_or("Unnamed field").to_owned());
+    let kind = custom["fieldType"].as_str().unwrap_or("").to_owned();
+    match kind.as_str() {
+        "string" | "concealed-string" if custom["value"].is_string() => {
+            let concealed = kind == "concealed-string" || label.trim().eq_ignore_ascii_case("pin");
+            field(ui, &label, &mut custom["value"], concealed, clipboard, status)
+        }
+        "boolean" if matches!(custom["value"].as_str(), Some("true" | "false")) => {
+            let mut checked = custom["value"] == "true";
+            if ui.checkbox(&mut checked, label.as_str()).changed() {
+                wipe(&mut custom["value"]);
+                custom["value"] = Value::String(checked.to_string());
+                true
+            } else { false }
+        }
+        _ => {
+            theme::caption(ui, format!("{} · {}", label.as_str(), kind));
+            false
+        }
+    }
+}
+
 fn field(
     ui: &mut egui::Ui,
     label: &str,
@@ -247,7 +393,7 @@ fn field(
     };
     let mut edited = Zeroizing::new(text.to_owned());
     let mut changed = false;
-    ui.label(label);
+    theme::caption(ui, label);
     ui.horizontal(|ui| {
         let reveal_id = ui.id().with(("reveal-field", label));
         let mut revealed = ui
@@ -256,7 +402,9 @@ fn field(
         let width = (ui.available_width() - if secret { 145.0 } else { 72.0 }).max(60.0);
         changed = ui
             .add(
-                egui::TextEdit::singleline(&mut *edited)
+                egui::TextEdit::multiline(&mut *edited)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(1)
                     .password(secret && !revealed)
                     .desired_width(width),
             )
@@ -283,62 +431,50 @@ fn field(
     }
     changed
 }
-pub fn password() -> Result<String, &'static str> {
-    use rand::TryRng;
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut bytes = Zeroizing::new([0; 24]);
-    rand::rngs::SysRng
-        .try_fill_bytes(&mut *bytes)
-        .map_err(|_| "Randomness unavailable")?;
-    Ok(bytes
-        .iter()
-        .map(|b| ALPHABET[(b & 63) as usize] as char)
-        .collect())
-}
 pub fn totp(v: &Value, now: u64) -> Result<(Zeroizing<String>, u64), &'static str> {
-    use hmac::{Hmac, KeyInit, Mac};
-    let period = v["period"].as_u64().ok_or("Invalid TOTP period")?;
-    let digits = v["digits"].as_u64().ok_or("Invalid TOTP digits")?;
-    if period == 0 || !(6..=8).contains(&digits) {
-        return Err("Unsupported TOTP parameters");
-    }
-    let raw = v["secret"].as_str().ok_or("Missing TOTP secret")?;
-    let key = Zeroizing::new(
-        data_encoding::BASE32_NOPAD
-            .decode(raw.trim_end_matches('=').as_bytes())
-            .map_err(|_| "Invalid TOTP secret")?,
-    );
-    macro_rules! mac {
-        ($hash:ty) => {{
-            let mut h = Hmac::<$hash>::new_from_slice(&key).map_err(|_| "Invalid TOTP key")?;
-            h.update(&(now / period).to_be_bytes());
-            Zeroizing::new(h.finalize().into_bytes().to_vec())
-        }};
-    }
-    let digest = match v["algorithm"].as_str() {
-        Some("sha1") => mac!(sha1::Sha1),
-        Some("sha256") => mac!(sha2::Sha256),
-        Some("sha512") => mac!(sha2::Sha512),
-        _ => return Err("Unsupported TOTP algorithm"),
-    };
-    let offset = (digest[digest.len() - 1] & 15) as usize;
-    let code = u32::from_be_bytes(
-        digest[offset..offset + 4]
-            .try_into()
-            .map_err(|_| "Invalid TOTP digest")?,
-    ) & 0x7fffffff;
-    Ok((
-        Zeroizing::new(format!(
-            "{:0width$}",
-            code % 10u32.pow(digits as u32),
-            width = digits as usize
-        )),
-        period - now % period,
-    ))
+    kagitaba_cxf::otp::code(v, now)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn passkey_details_preserve_data_and_conceal_handle_and_key() {
+        use p256::pkcs8::EncodePrivateKey;
+        use base64::Engine;
+        let key=p256::SecretKey::from_slice(&[7;32]).unwrap().to_pkcs8_der().unwrap();
+        let encoded=base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.as_bytes());
+        let value=serde_json::json!({"type":"passkey","rpId":"example.com","username":"Synthetic account","credentialId":"synthetic-credential","userHandle":"HIDDEN_SYNTHETIC_HANDLE","key":encoded,"kagitabaBackupFlags":{"eligible":false,"state":false}});
+        assert_eq!(passkey_algorithm(&value),"ES256 / P-256");
+        assert_eq!(passkey_algorithm(&serde_json::json!({"key":"invalid"})),"Unknown");
+        let original=value.clone();
+        let ctx=egui::Context::default();let mut clip=Clipboard{inner:None,owned:None};let mut status=None;
+        let mut output=ctx.run_ui(Default::default(),|ui|passkey_details(ui,&value,&mut clip,&mut status));
+        output.textures_delta.clear();
+        fn gather(shape:&egui::epaint::Shape,text:&mut String) { match shape {egui::epaint::Shape::Text(t)=>text.push_str(&t.galley.job.text),egui::epaint::Shape::Vec(v)=>for s in v {gather(s,text)},_=>()}}
+        let mut text=String::new();for shape in output.shapes {gather(&shape.shape,&mut text);}
+        assert!(text.contains("synthetic-credential"));assert!(text.contains("Synthetic account"));
+        assert!(!text.contains("HIDDEN_SYNTHETIC_HANDLE"));assert!(!text.contains(&encoded));assert_eq!(value,original);
+    }
+
+    #[test]
+    fn custom_pin_is_concealed_without_changing_source_type() {
+        for (label,kind,hidden) in [("Pin","string",true),(" PIN ","string",true),("Reference","string",false),("Reference","concealed-string",true)] {
+            let ctx=egui::Context::default();
+            let mut value=serde_json::json!({"label":label,"fieldType":kind,"value":"SYNTHETIC_PIN_VALUE","vendor":{"kept":true}});
+            let original=value.clone();
+            let mut clip=Clipboard { inner:None,owned:None };
+            let mut status=None;
+            let mut output=ctx.run_ui(Default::default(),|ui| { assert!(!custom_field(ui,&mut value,&mut clip,&mut status)); });
+            output.textures_delta.clear();
+            fn gather(shape:&egui::epaint::Shape,text:&mut String) {
+                match shape { egui::epaint::Shape::Text(t)=>text.push_str(&t.galley.job.text),egui::epaint::Shape::Vec(v)=>for s in v {gather(s,text)},_=>() }
+            }
+            let mut text=String::new();for shape in output.shapes {gather(&shape.shape,&mut text);}
+            assert_eq!(text.contains("SYNTHETIC_PIN_VALUE"),!hidden);
+            assert_eq!(value,original);
+        }
+    }
+
     #[test]
     fn rfc6238_vectors() {
         for (algorithm, secret, expected) in [
@@ -384,7 +520,7 @@ mod tests {
         ] {
             let mut text = input.to_owned();
             let mut output = ctx.run_ui(Default::default(), |ui| {
-                show(ui, &mut text, &mut clipboard);
+                show(ui, &mut text, &mut clipboard, &mut Default::default());
             });
             output.textures_delta.clear();
             assert_eq!(text, input);

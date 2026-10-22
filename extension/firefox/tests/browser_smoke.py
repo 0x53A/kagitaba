@@ -16,6 +16,7 @@ import time
 import urllib.parse
 import zipfile
 from local_installation import seed_installation
+from credential_tools_smoke import exercise_tools
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -108,7 +109,26 @@ def main():
             assert send({"type": "entry", "id": fixture["entryId"]})["entity"]["title"] == "Edited in real Firefox"
             driver.refresh()
             def click(label):
-                WebDriverWait(driver, 10).until(lambda d: d.execute_script("const b=[...document.querySelectorAll('button')].find(b=>b.textContent===arguments[0]);if(!b||b.disabled)return false;b.click();return true;", label))
+                WebDriverWait(driver, 10).until(lambda d: d.execute_script("const root=document.querySelector('dialog[open]')??document;const b=[...root.querySelectorAll('button')].find(b=>b.textContent===arguments[0]||b.querySelector('strong')?.textContent===arguments[0]);if(!b||b.disabled)return false;b.click();return true;", label))
+            encoded = lambda raw: base64.urlsafe_b64encode(bytes.fromhex(raw)).decode().rstrip("=")
+            collection_id = "cc" * 16
+            collection = {"format":"kagitaba-cxf","version":1,"cxfVersion":{"major":1,"minor":0},"kind":"collection","entity":{"id":encoded(collection_id),"title":"Test collection","items":[{"item":encoded(fixture["entryId"]),"account":"ZXh0ZXJuYWw"}],"subCollections":[{"id":encoded("dd"*16),"title":"Nested collection","items":[{"item":encoded(fixture["entryId"])}]}]}}
+            send({"type":"save","id":collection_id,"payload":collection})
+            driver.refresh()
+            click("Entries not in a collection")
+            WebDriverWait(driver,10).until(lambda d:d.execute_script("return document.querySelector('.collection-tree button[aria-current=true]')?.textContent==='Entries not in a collection' && !document.querySelector('.entries button')"))
+            click("Test collection")
+            WebDriverWait(driver,10).until(lambda d:d.execute_script("return document.querySelector('.collection-status')?.textContent.includes('1 unavailable')"))
+            click("Nested collection")
+            WebDriverWait(driver,10).until(lambda d:d.execute_script("return document.querySelector('.entries strong')?.textContent==='Edited in real Firefox'"))
+            assert driver.execute_script("return document.querySelector('.entry-id').textContent") == fixture["entryId"][:8]
+            assert driver.execute_script("return !!document.querySelector('.entry-usernames').textContent")
+            driver.set_window_size(1100,820)
+            driver.save_screenshot(str(ROOT / "target/firefox-collections-wide.png"))
+            driver.set_window_size(540,820)
+            WebDriverWait(driver,10).until(lambda d:d.execute_script("const t=document.querySelector('.collection-tree'),r=t.querySelector('[aria-current=true]');return r.getBoundingClientRect().bottom<=t.getBoundingClientRect().bottom+1;"))
+            driver.save_screenshot(str(ROOT / "target/firefox-collections-narrow.png"))
+            click("All entries")
             click("Edited in real Firefox")
             click("Edit entry")
             title = driver.execute_script("return [...document.querySelectorAll('label')].find(l=>l.textContent==='Title').control;")
@@ -118,6 +138,7 @@ def main():
             form_saved = send({"type": "entry", "id": fixture["entryId"]})
             assert form_saved["entity"]["title"] == "Saved through the form"
             assert form_saved["entity"]["credentials"] == payload["entity"]["credentials"]
+            payload = exercise_tools(driver, send, click, fixture)
             driver.save_screenshot(str(ROOT / "target/firefox-entry-edit.png"))
             click("Back to entries")
             WebDriverWait(driver, 10).until(lambda d: d.execute_script("return !!document.querySelector('.entries button');"))
@@ -150,11 +171,15 @@ def main():
                 script = "window.result=null;window.failure=null;navigator.credentials.%s({publicKey:%s}).then(c=>window.result=c.toJSON(),e=>window.failure=e.name);"
                 options="{challenge:new Uint8Array(32).fill(7),rp:{id:'example.test',name:'Test'},user:{id:new Uint8Array([1,2]),name:'synthetic',displayName:'Synthetic'},pubKeyCredParams:[{type:'public-key',alg:-7}]}" if kind=="create" else "{challenge:new Uint8Array(32).fill(8),rpId:'example.test',userVerification:'required'}"
                 driver.execute_script(script % (kind,options))
+                chooser=wait_result(lambda:driver.execute_script("return document.querySelector('#kagitaba-passkey-chooser')?.shadowRoot.querySelector('[data-backend=browser]')"))
+                chooser.click()
                 handle=wait_result(lambda:next(iter(set(driver.window_handles)-old_handles),None))
                 driver.switch_to.window(handle)
                 wait_result(lambda:"request=" in driver.current_url)
                 assert driver.execute_async_script("const done=arguments[arguments.length-1];browser.windows.getCurrent().then(w=>done(w.type));") == "popup"
                 request_id=urllib.parse.parse_qs(urllib.parse.urlparse(driver.current_url).query)["request"][0]
+                if not send({"type":"status"})["unlocked"]:
+                    send({"type":"unlock","prf":fixture["prf"]})
                 request=send({"type":"request","requestId":request_id})
                 arguments={"type":"approve","requestId":request_id,"prf":fixture["prf"],"uv":True}
                 if kind=="get":
@@ -167,6 +192,11 @@ def main():
                 return result
 
             created=approve_request("create")
+            # Native toolbar mode must not hide an existing browser wallet from
+            # the chooser or prevent its existing unlock/approval flow.
+            driver.switch_to.window(app_handle)
+            send({"type":"backend-mode","mode":"native"})
+            driver.switch_to.window(website_handle)
             authenticated=approve_request("get")
             decode=lambda value:base64.urlsafe_b64decode(value+"="*((-len(value))%4))
             public=serialization.load_der_public_key(decode(created["response"]["publicKey"]))
@@ -177,11 +207,11 @@ def main():
             assert json.loads(client)["origin"]==f"https://example.test:{server.server_port}"
             assert authenticated["id"]==created["id"]
             driver.switch_to.window(app_handle)
-            assert len(send({"type":"status"})["entries"])==2
+            assert len([entry for entry in send({"type":"status"})["entries"] if entry["kind"]=="item"])==2
             driver.switch_to.window(website_handle)
             old_handles=set(driver.window_handles)
             driver.execute_script("window.failure=null;navigator.credentials.get({publicKey:{challenge:new Uint8Array(32),rpId:'example.test'}}).catch(e=>window.failure=e.name)")
-            wait_result(lambda:set(driver.window_handles)-old_handles)
+            wait_result(lambda:driver.execute_script("return !!document.querySelector('#kagitaba-passkey-chooser')"))
             driver.switch_to.window(app_handle)
             send({"type":"lock"})
             driver.switch_to.window(website_handle)

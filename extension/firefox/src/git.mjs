@@ -3,13 +3,16 @@ import LightningFS from '@isomorphic-git/lightning-fs';
 import http from 'isomorphic-git/http/web';
 import {connectionStep} from './errors.mjs';
 import {mergeBase, mergeFiles, equalFiles} from './merge-policy.mjs';
+import {encode as b64, decode as unb64} from './encoding.mjs';
+export {b64, unb64};
 
 const enc = new TextEncoder();
 const dec = new TextDecoder('utf-8', { fatal: true });
-export function b64(bytes) { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, ''); }
-export function unb64(s) { if (typeof s !== 'string' || !/^[A-Za-z0-9_-]*$/.test(s)) throw Error('Invalid binary encoding'); return Uint8Array.from(atob(s.replaceAll('-', '+').replaceAll('_', '/')), c => c.charCodeAt(0)); }
 const oidOK = s => typeof s === 'string' && /^[a-f0-9]{40}$/.test(s);
 const MAX = 256 * 1024 * 1024;
+// KAF1 header plus at most 64 length-prefixed one-MiB KTC1 chunks.
+const MAX_ATTACHMENT = 8 + 64 * (4 + 1024 * 1024 + 76);
+const attachmentPath = path => /^entries\/[0-9a-f]{32}\/attachments\/[0-9a-f]{32}$/.test(path);
 function parseCommit(bytes) {
   if (bytes.length > 16384) throw Error('Oversized commit');
   const text = dec.decode(bytes), split = text.indexOf('\n\n');
@@ -57,7 +60,7 @@ export class GitReplica {
     if (!oidOK(oid)) throw Error('Invalid object ID');
     const o = await git.readObject({ ...this.opts, oid, format: 'content' });
     const bytes = new Uint8Array(o.object);
-    if (bytes.length > 16 * 1024 * 1024 || !['commit', 'tree', 'blob'].includes(o.type)) throw Error('Invalid object');
+    if (bytes.length > (o.type === 'blob' ? MAX_ATTACHMENT : 16 * 1024 * 1024) || !['commit', 'tree', 'blob'].includes(o.type)) throw Error('Invalid object');
     const header = enc.encode(`${o.type} ${bytes.length}\0`), raw = new Uint8Array(header.length + bytes.length); raw.set(header); raw.set(bytes, header.length);
     if ((await this.crypto('hash', { algorithm: 'sha1', data: b64(raw) })).hex !== oid) throw Error('Object digest mismatch');
     return { type: o.type, bytes };
@@ -74,7 +77,7 @@ export class GitReplica {
         if (e.mode === '040000') await visit(e.oid, path + '/', depth + 1);
         else if (e.mode === '100644') {
           const blob = await this.object(e.oid); budget -= blob.bytes.length;
-          if (blob.type !== 'blob' || blob.bytes.length > 2 * 1024 * 1024 + 100 || budget < 0 || ++count > 100000 || Object.hasOwn(files, path)) throw Error('Snapshot limit');
+          if (blob.type !== 'blob' || blob.bytes.length > (attachmentPath(path) ? MAX_ATTACHMENT : 2 * 1024 * 1024 + 100) || budget < 0 || ++count > 100000 || Object.hasOwn(files, path)) throw Error('Snapshot limit');
           files[path] = b64(blob.bytes);
         } else throw Error('Unsupported tree mode');
       }
@@ -181,7 +184,7 @@ export class GitReplica {
     let budget = 512 * 1024 * 1024;
     for (const o of bundle.objects) {
       const bytes = unb64(o.data); budget -= bytes.length;
-      if (budget < 0 || bytes.length > 16 * 1024 * 1024 || !['blob', 'tree', 'commit'].includes(o.type)) throw Error('Transfer limit');
+      if (budget < 0 || bytes.length > (o.type === 'blob' ? MAX_ATTACHMENT : 16 * 1024 * 1024) || !['blob', 'tree', 'commit'].includes(o.type)) throw Error('Transfer limit');
       const id = await git.writeObject({ ...this.opts, type: o.type, object: bytes, format: 'content' }); if (id !== o.oid) throw Error('Transfer digest mismatch');
     }
     if (!this.state.head && !root) throw Error('Explicit root trust is required');

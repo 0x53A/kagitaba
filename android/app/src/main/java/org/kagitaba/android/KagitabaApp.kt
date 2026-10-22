@@ -12,8 +12,25 @@ class KagitabaApp : Application() {
     lateinit var vault: Vault
     lateinit var wallets: WalletCatalog
     private val generations = java.util.concurrent.atomic.AtomicLong()
+    private var enrollmentSession = false
     fun nextEpoch(): Long = generations.incrementAndGet()
+    fun beginEnrollment() {
+        vault.lock()
+        enrollmentSession = true
+        // Public-key export has no repository or catalog entry. Keep the normal
+        // selected-wallet record intact, including across process death.
+        vault = Vault(this, java.io.File(cacheDir, "enrollment-session"), "")
+    }
+    fun endEnrollment() {
+        if (!enrollmentSession) return
+        enrollmentSession = false
+        vault.lock()
+        val selected = wallets.selected()
+        vault = if (selected != null) Vault(this, wallets.root(selected), selected)
+            else Vault(this, java.io.File(noBackupFilesDir, "unselected"), "")
+    }
     fun selectWallet(id: String) {
+        endEnrollment()
         if (vault.walletId == id) return
         vault.lock()
         wallets.select(id)

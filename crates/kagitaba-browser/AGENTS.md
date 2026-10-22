@@ -61,10 +61,14 @@ Each request has an `op` plus the fields listed below. Responses are objects:
   `previous` with the same mapping; returns `signers` PEM array, `participants`
   mapping ID to PEM and `entries` array of entry IDs. Enforces native layout,
   signer registration, grants, and revision transitions; this is structural
-  validation, not history/signature authorization. Limit: 64 MiB decoded files,
-  100,000 files, 96 MiB complete request JSON.
+  validation, not history/signature authorization. Limit: 256 MiB decoded files,
+  100,000 files, 768 MiB complete request JSON (including both snapshots).
   `participantMetadata` returns validated meta.entry pointers, never decrypted
   names. Legacy name.json/browser.json are parsed only for history compatibility.
+  `participants/<p>/index-key` accepts a valid KTW1 wrapper whose recipient is p;
+  `cache/<p>/index` accepts up to 2 MiB of disposable cache bytes, requiring p to
+  be enrolled with an index key. Corrupt cache ciphertext does not invalidate an
+  otherwise signed snapshot; cache consumers rebuild it. Unknown paths still fail.
 - `metadata_encrypt`: `entryId`, `participantId`, `name`, `recipients`, optional
   previous decrypted `payload`; creates a new revision of the participant JSON
   defined in root AGENTS.md, preserving unknown fields. An empty name removes
@@ -79,7 +83,9 @@ Each request has an `op` plus the fields listed below. Responses are objects:
   `uv`; returns `authenticatorData`, DER `signature`. `passkey_validate` takes
   `privateKey`, returns `publicKey` SPKI and `publicKeyAlgorithm:-7`; unsupported
   algorithms and malformed keys fail explicitly. The counter is always zero,
-  including imported credentials. Flags set UP and BE; BS remains unset. UV is
+  including imported credentials. Flags set UP; absent `kagitabaBackupFlags` defaults to BE=true/BS=false.
+  Present eligible/state booleans are preserved; malformed flags and BS without BE
+  reject validation/assertion. Applications forward only credential-owned flags. UV is
   only set when the trusted caller supplies a verified decision, not a click.
   The native Android provider can supply `clientDataHash` instead of JSON for
   privileged browser requests: exactly 32 bytes, appended directly to authenticator
@@ -124,3 +130,25 @@ executes the actual WASM module after building it and installing extension npm
 dependencies. It checks WebAuthn signatures with Node/OpenSSL and transfers a
 native signed Git wallet through the browser, adds a browser-signed revision,
 reopens it and verifies it again through the native store. All keys are synthetic.
+
+
+Application helpers: password_generate accepts a serialized password::Rules as
+rules and returns password/alphabet, using injected entropy. totp_parse takes uri
+and returns credential; totp_code takes credential and integer now (Unix seconds)
+and returns code/remaining. qr_scan takes width/height plus base64url grayscale
+pixels (at most 2048×2048), returning distinct supported uris for explicit review.
+These helpers do not access a wallet or authenticate websites. payload_edit also
+supports indexed logins/totps/notes, exact urls and appendCredentials; original
+unknown fields and unrelated credentials remain authoritative.
+
+Attachment-aware snapshot validation accepts single KAF1 blobs at
+`entries/<entry>/attachments/<blob>` with the native reader’s size bounds. Container
+parsing and authentication are deferred until explicit file access; accepting a
+snapshot does not authenticate attachment plaintext. IDs are canonical
+32-hex, owners exist and are not participant metadata, and each owner has at most
+128 blobs. Attachment changes require a new primary revision; recipient reductions
+cannot retain old blob IDs. Snapshot totals are 256 MiB; request JSON is bounded to
+768 MiB for two base64 snapshots. This is in-memory processing, not streaming.
+`validate_attachment_edit` takes `entryId`, new raw `payload` and optional raw
+`previousPayload`. Owned descriptors must match exactly, or be absent for a new
+entry. This guards client editors that do not implement attachment rekey/removal.

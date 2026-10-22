@@ -6,3 +6,6 @@ for(const name of ['manifest.json','app.html','app.css'])await copyFile(name,`di
 await copyFile('pkg/kagitaba_browser_bg.wasm','dist/kagitaba_browser_bg.wasm');
 const manifest=JSON.parse(await readFile('dist/manifest.json','utf8'));
 console.log(`Built ${manifest.name} ${manifest.version} in extension/firefox/dist`);
+
+await copyFile('../../assets/fonts/DejaVuSansMono.ttf','dist/DejaVuSansMono.ttf');
+await copyFile('../../assets/fonts/LICENSE','dist/FONT-LICENSE');

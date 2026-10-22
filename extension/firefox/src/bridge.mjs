@@ -44,7 +44,9 @@ for (const kind of ['create', 'get']) {
       pending.set(id, async value => {
         clean();
         try {
-          if (value.fallback) resolve(await native[kind](options));
+          // Adopt Firefox's promise directly, preserving its AbortError and other
+          // native errors instead of converting them to our NotAllowedError.
+          if (value.fallback) resolve(native[kind](options));
           else if (value.error) reject(new DOMException(value.error, 'NotAllowedError'));
           else resolve(unpack(value.credential));
         } catch { reject(new DOMException('Credential request failed', 'NotAllowedError')); }

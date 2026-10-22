@@ -13,7 +13,7 @@ function fixture() {
   const nodes = new Map();
   function node(tag='div') {return {tag,children:[],dataset:{},hidden:false,setAttribute(){},querySelectorAll:()=>[],set textContent(value){this.text=value;this.children=[];},append(...items){this.children.push(...items);},replaceChildren(...items){this.children=items;}};}
   let listener, resolve, reject, signal;
-  const context = vm.createContext({URLSearchParams,AbortController,location:{search:''},
+  const context = vm.createContext({URLSearchParams,AbortController,TextDecoder,TextEncoder,ResizeObserver:class {observe(){}},location:{search:''},
     document:{querySelector:id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id);},querySelectorAll:()=>[],createElement:node},
     window:{addEventListener(){}},
     browser:{runtime:{sendMessage:()=>new Promise(()=>{}),onMessage:{addListener:callback=>{listener=callback;}}}},

@@ -6,6 +6,7 @@ internal object WalletErrors {
         "Unknown wallet participant",
         "Participant name must be 1–128 characters without surrounding whitespace or control characters.",
         "Invalid wallet request or credential encoding",
+        "Attachment recipients must be changed in the native app",
         "Unsupported wallet history. Update all clients to a version supporting signed merges.",
         "Wallet history does not include this device's trusted checkpoint. Fetch updates or resolve divergence on your computer; do not reset trust.",
         "These wallets have different origins and cannot be merged.",

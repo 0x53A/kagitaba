@@ -28,17 +28,17 @@ class Vault(private val context: Context, private val directory: File = context.
     private val operations = Mutex()
     private val stateFile = AtomicFile(File(directory, "wallet-state.json"))
     private val repoDir = File(directory, "wallet")
-    private var pendingToken: ByteArray? = null
+    private val deviceToken = DeviceToken()
     @Volatile private var state = if (stateFile.baseFile.exists()) JSONObject(String(stateFile.readFully())) else JSONObject()
     @Volatile private var snapshot: JSONObject? = null
     val lockListeners = mutableSetOf<() -> Unit>()
     val unlocked get() = session.unlocked
     val connected get() = synchronized(gate) { state.has("head") }
-    fun settings(): JSONObject = synchronized(gate) { JSONObject(state.toString()).apply { remove("token") } }
+    fun settings(): JSONObject = synchronized(gate) { JSONObject(state.toString()).apply { remove("token"); remove("deviceToken"); put("hasDeviceToken", state.has("deviceToken")) } }
     fun unlock(bytes: ByteArray) { session.open(bytes); (context as KagitabaApp).touch() }
     fun lock() {
         session.invalidate()
-        synchronized(gate) { snapshot = null; pendingToken?.fill(0); pendingToken = null }
+        synchronized(gate) { snapshot = null }
         device.close()
         RequestTickets.clear(); AutofillRequests.clear()
         val notify = Runnable { lockListeners.toList().forEach { it() } }
@@ -102,13 +102,13 @@ class Vault(private val context: Context, private val directory: File = context.
                 git.checkout().setName("wallet").call()
                 val next = JSONObject(state.toString()).put("url", canonical).put("username", username).put("autoSync", autoSync)
                 next.remove("token")
+                next.put("deviceToken", deviceToken.seal(token, tokenContext(canonical, username)))
                 next.put("root", verified.getString("root")).put("head", verified.getString("head"))
                 persist(next); snapshot = verified
-                pendingToken?.fill(0); pendingToken = token.toByteArray()
             }
         }
     } }
-    private fun authContext(url: String, username: String) = json("application" to "kagitaba-android-git-v1", "url" to url, "username" to username).toString()
+    private fun tokenContext(url: String, username: String) = json("application" to "kagitaba-android-device-git-v1", "wallet" to walletId, "url" to url, "username" to username).toString()
     suspend fun unlockCandidates(): JSONArray = withContext(Dispatchers.IO) { operations.withLock { synchronized(gate) {
         val verified = read()
         val signers = verified.getJSONObject("signingKeys")
@@ -119,16 +119,8 @@ class Vault(private val context: Context, private val directory: File = context.
                 "name" to "", "device" to devices.optJSONObject(id))
         }.toList())
     } } }
-    suspend fun finishUnlock() = withContext(Dispatchers.IO) { operations.withLock { secret { key ->
+    suspend fun finishUnlock() = withContext(Dispatchers.IO) { operations.withLock { secret { _ ->
         if (connected) requireParticipant(read())
-        val token = synchronized(gate) { pendingToken?.copyOf() }
-        token?.let { bytes ->
-            try {
-                val encrypted = NativeBridge.call("local_encrypt", json("identity" to key, "context" to authContext(state.getString("url"), state.optString("username")), "plaintext" to String(bytes)))
-                persist(JSONObject(state.toString()).put("token", encrypted.getString("envelope")))
-                synchronized(gate) { pendingToken?.fill(0); pendingToken = null }
-            } finally { bytes.fill(0) }
-        }
     } } }
     private fun requireParticipant(verified: JSONObject) {
         check(verified.getJSONObject("participants").has(device.publicInfo().getString("participantId"))) {
@@ -138,20 +130,19 @@ class Vault(private val context: Context, private val directory: File = context.
     suspend fun saveConnection(url: String, username: String, token: String, auto: Boolean) = withContext(Dispatchers.IO) { operations.withLock { synchronized(gate) {
         val canonical = canonicalUrl(url)
         val next = JSONObject(state.toString())
-        if (token.isNotEmpty() || !state.has("token") || canonical != state.optString("url") || username != state.optString("username")) {
-            if (unlocked) secret { key -> next.put("token", NativeBridge.call("local_encrypt", json("identity" to key, "context" to authContext(canonical, username), "plaintext" to token)).getString("envelope")) }
-            else { next.remove("token"); pendingToken?.fill(0); pendingToken = token.toByteArray() }
+        if (token.isNotEmpty() || !state.has("deviceToken") || canonical != state.optString("url") || username != state.optString("username")) {
+            next.put("deviceToken", deviceToken.seal(token, tokenContext(canonical, username)))
         }
+        next.remove("token")
         next.put("url", canonical).put("username", username).put("autoSync", auto)
         // Changing endpoint preserves the existing root and checkpoint.
         persist(next)
     } } }
     suspend fun sync(): String = withContext(Dispatchers.IO) { operations.withLock {
-        val credentials = secret { key ->
-            check(state.has("token")) { "Re-enter the Git token for your YubiKey participant." }
+        val credentials = secret { _ ->
+            check(state.has("deviceToken")) { DeviceToken.ERROR }
             val url = state.getString("url"); val username = state.optString("username")
-            Triple(url, username, NativeBridge.call("local_decrypt", json("identity" to key,
-                "context" to authContext(url, username), "envelope" to state.getString("token"))).getString("plaintext"))
+            Triple(url, username, deviceToken.open(state.getString("deviceToken"), tokenContext(url, username)))
         }
         git().use { git ->
             fetch(git, credentials.first, credentials.second, credentials.third)
@@ -184,6 +175,33 @@ class Vault(private val context: Context, private val directory: File = context.
             }
         }
     } }
+    suspend fun catalogue(): WalletIndex = withContext(Dispatchers.IO) { operations.withLock { secret { key ->
+        val captured = epoch
+        val result = request("store_catalog", json("identity" to key))
+        synchronized(gate) {
+            check(unlocked && epoch == captured) { "Authentication expired" }
+            if (result.getString("head") != state.getString("head")) {
+                val next = JSONObject(state.toString()).put("head", result.getString("head"))
+                if (result.getBoolean("written")) next.put("syncStatus", "Saved locally · synchronization pending")
+                persist(next)
+            }
+            snapshot = null
+        }
+        WalletIndex(result.getJSONArray("rows"))
+    } } }
+    suspend fun entry(id: String): WalletItem = withContext(Dispatchers.IO) { operations.withLock { secret { key ->
+        val verified = read()
+        requireParticipant(verified)
+        val metadata = verified.getJSONObject("participantMetadata")
+        check(metadata.keys().asSequence().none { metadata.getString(it) == id }) { "Not a credential entry" }
+        val records = verified.getJSONArray("entries")
+        val record = (0 until records.length()).map { records.getJSONObject(it) }.firstOrNull { it.getString("id") == id } ?: error("Entry is no longer available")
+        val grant = record.getJSONObject("grants").optString(device.publicInfo().getString("participantId"))
+        check(grant.isNotEmpty()) { "Entry is not available to this key" }
+        WalletItem(id, JSONObject(NativeBridge.call("entry_decrypt", json("identity" to key, "primary" to record.getString("primary"), "grant" to grant)).getString("payload")))
+    } } }
+    // Foreground provider matching needs complete credentials; ordinary UI listing
+    // uses catalogue() and opens only the selected entry with entry(id).
     suspend fun entries(): List<WalletItem> = withContext(Dispatchers.IO) { operations.withLock { secret { key ->
         val verified = read()
         requireParticipant(verified)
@@ -216,6 +234,14 @@ class Vault(private val context: Context, private val directory: File = context.
         val ids = existing?.getJSONObject("grants")?.keys()?.asSequence()?.toList() ?: participants.keys().asSequence().toList()
         require(ids.isNotEmpty()) { "Select wallet recipients before saving" }
         val recipients = JSONArray(ids.map { participants.getString(it) })
+        val attachmentEdit = json("entryId" to item.id, "payload" to item.payload.toString())
+        if (existing?.optBoolean("hasAttachments") == true) {
+            val grant = existing.getJSONObject("grants").getString(device.publicInfo().getString("participantId"))
+            val previous = NativeBridge.call("entry_decrypt", json("identity" to key,
+                "primary" to existing.getString("primary"), "grant" to grant)).getString("payload")
+            attachmentEdit.put("previousPayload", previous)
+        }
+        NativeBridge.call("validate_attachment_edit", attachmentEdit)
         val encrypted = NativeBridge.call("entry_encrypt", json("entryId" to item.id, "payload" to item.payload.toString(), "recipients" to recipients))
         encrypted.put("identity", key).put("entryId", item.id)
         accepted(request("store_save", encrypted))

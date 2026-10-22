@@ -52,6 +52,7 @@ async function crypto(op, fields = {}) {
   await ready;
   const entropy = randomBytes(65536);
   try { return JSON.parse(await command(JSON.stringify({op, ...fields}), entropy)); }
+  catch { throw Error(`WASM operation failed: ${op}`); }
   finally { entropy.fill(0); }
 }
 
@@ -142,4 +143,78 @@ test('bundled WASM verifies a native merge from either checkpoint and signs a du
   fs.writeFileSync(returnPath, JSON.stringify(bundle)); fs.writeFileSync(rootPath, fixture.root);
   execFileSync('nix-shell', ['--run', `cargo run -q -p kagitaba-store --example browser_transfer -- import ${quote(nativeWallet)} ${quote(rootPath)} ${quote(parents[1])} ${quote(returnPath)} --confirmed-trust`], {cwd:root});
   await assert.rejects(reopened.importTransfer(fixture), /Rollback|divergent/);
+});
+
+test('shared credential tools preserve unrestricted fields and generate matching TOTP codes', async()=>{
+  await ready;
+  const call=async(op,args={})=>JSON.parse(await command(JSON.stringify({op,...args}),randomBytes(65536)));
+  const generated=await call('password_generate',{rules:{}});
+  assert.match(generated.password,/^[acdefhjkmnprtuvwxy347]{12}$/);
+  assert.match(generated.password,/[347]/);
+  const {credential}=await call('totp_parse',{uri:'otpauth://totp/Example:alice?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=300&digits=8'});
+  assert.equal(credential.period,300);
+  assert.equal((await call('totp_code',{credential:{...credential,period:30},now:59})).code,'94287082');
+  const id='01010101010101010101010101010101';
+  const payload=JSON.stringify({format:'kagitaba-cxf',version:1,cxfVersion:{major:1,minor:0},kind:'item',entity:{id:'AQEBAQEBAQEBAQEBAQEBAQ',title:'Test',credentials:[{type:'basic-auth',password:{fieldType:'concealed-string',value:'old',vendor:'kept'}},{type:'basic-auth',password:{fieldType:'concealed-string',value:'second'}},credential],scope:{urls:['http://localhost/path?q=1#f','ssh://host','bare host',''],androidApps:[]}}});
+  const result=await call('payload_edit',{entryId:id,payload,changes:{logins:[{index:1,password:'\n unicode 密码 \t'}]}});
+  const edited=JSON.parse(result.payload);
+  assert.deepEqual(edited.entity.scope,JSON.parse(payload).entity.scope);
+  assert.deepEqual(edited.entity.credentials[0],JSON.parse(payload).entity.credentials[0]);
+  assert.equal(edited.entity.credentials[1].password.value,'\n unicode 密码 \t');
+  assert.equal(edited.entity.credentials[2].period,300);
+});
+
+test('generator rank-zero vector matches native and Android',async()=>{
+  await ready;
+  const result=JSON.parse(await command(JSON.stringify({op:'password_generate',rules:{}}),new Uint8Array(65536)));
+  assert.equal(result.password,'aaaaaaaaaaa3');
+  await assert.rejects(command(JSON.stringify({op:'password_generate',rules:{}}),new Uint8Array()));
+});
+
+test('native attachment above 16 MiB survives WASM validation, browser edit and native reimport', async t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'kagitaba-attachments-'));
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const quote=s=>`'${s.replaceAll("'", "'\\''")}'`;
+  const fixturePath=path.join(dir,'fixture.json'),nativeWallet=path.join(dir,'wallet');
+  execFileSync('nix-shell',['--run',`cargo run -q -p kagitaba-store --example browser_fixture -- ${quote(fixturePath)} ${quote(nativeWallet)} --attachment`],{cwd:root});
+  const fixture=JSON.parse(fs.readFileSync(fixturePath));
+  const replicaDir=path.join(dir,'replica');fs.mkdirSync(replicaDir);
+  const promises={};
+  for(const name of ['mkdir','readFile','writeFile','stat','lstat','readdir','unlink','rmdir','readlink'])promises[name]=(p,...args)=>fs.promises[name](replicaDir+p,...args);
+  promises.rename=(a,b)=>fs.promises.rename(replicaDir+a,replicaDir+b);
+  promises.symlink=(target,p)=>fs.promises.symlink(target,replicaDir+p);
+  const replica=new GitReplica({crypto,fs:{promises}});await replica.init();
+  await replica.importTransfer(fixture,{root:fixture.root,checkpoint:fixture.head});
+  const files=await replica.snapshot(), blob=Object.keys(files).find(p=>p.includes('/attachments/'));
+  assert.ok(blob);assert.ok(unb64(files[blob]).length>16*1024*1024);
+  const id='07'.repeat(16),identity=b64(Buffer.concat([Buffer.from('KBI1'),Buffer.alloc(32,8),Buffer.alloc(32,12)]));
+  const grant=Object.keys(files).find(p=>p.startsWith(`entries/${id}/grants/`));
+  const {payload}=await crypto('entry_decrypt',{identity,primary:files[`entries/${id}/primary`],grant:files[grant]});
+  const edited=await crypto('payload_edit',{entryId:id,payload,changes:{title:'Browser edit keeps file'}});
+  await crypto('validate_attachment_edit',{entryId:id,payload:edited.payload,previousPayload:payload});
+  const recipient=textDecoder(files[Object.keys(files).find(p=>/^participants\/[^/]+\/pub.pem$/.test(p))]);
+  const encrypted=await crypto('entry_encrypt',{entryId:id,payload:edited.payload,recipients:[recipient]});
+  const {replaceEntry}=await import('../src/drafts.mjs');
+  const next=replaceEntry(files,id,encrypted);assert.equal(next[blob],files[blob]);
+  await replica.commit(next,identity,'Synthetic attachment-preserving edit');
+  const exported=await replica.exportTransfer(),returnPath=path.join(dir,'returned.json'),rootPath=path.join(dir,'root.pem');
+  fs.writeFileSync(returnPath,JSON.stringify(exported));fs.writeFileSync(rootPath,fixture.root);
+  execFileSync('nix-shell',['--run',`cargo run -q -p kagitaba-store --example browser_transfer -- import ${quote(nativeWallet)} ${quote(rootPath)} ${quote(fixture.head)} ${quote(returnPath)} --confirmed-trust`],{cwd:root});
+  assert.equal((await replica.snapshot())[blob],files[blob]);
+});
+function textDecoder(encoded){return new TextDecoder().decode(unb64(encoded));}
+
+test('bundled WASM signs stored backup flags and rejects malformed backup state',async()=>{
+ const data=type=>b64(text(JSON.stringify({type,challenge:b64(randomBytes(32)),origin:'https://example.test'})));
+ const created=await crypto('passkey_create',{rpId:'example.test',userHandle:b64(randomBytes(16)),clientDataJSON:data('webauthn.create'),uv:true});
+ const publicKey=createPublicKey({key:Buffer.from(unb64(created.publicKey)),format:'der',type:'spki'});
+ const client=data('webauthn.get');
+ for(const [eligible,state,expected] of [[false,false,0x05],[true,false,0x0d],[true,true,0x1d]]){
+  const signed=await crypto('passkey_assert',{privateKey:created.privateKey,rpId:'example.test',clientDataJSON:client,uv:true,kagitabaBackupFlags:{eligible,state}});
+  const auth=unb64(signed.authenticatorData);assert.equal(auth[32],expected);
+  const message=Buffer.concat([auth,createHash('sha256').update(unb64(client)).digest()]);
+  assert.equal(verify('sha256',message,publicKey,unb64(signed.signature)),true);
+ }
+ await assert.rejects(crypto('passkey_assert',{privateKey:created.privateKey,rpId:'example.test',clientDataJSON:client,uv:true,kagitabaBackupFlags:{eligible:false,state:true}}));
+ await assert.rejects(crypto('passkey_validate',{privateKey:created.privateKey,kagitabaBackupFlags:null}));
 });

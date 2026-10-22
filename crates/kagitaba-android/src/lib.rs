@@ -5,6 +5,7 @@
 
 mod piv;
 mod store;
+mod index;
 
 use jni::{
     JNIEnv,
@@ -15,7 +16,7 @@ use zeroize::Zeroizing;
 
 /// Native-testable boundary; errors never contain request values or credentials.
 pub fn execute(request: &[u8], random: Vec<u8>) -> Result<String, &'static str> {
-    if request.len() > 96 * 1024 * 1024 || random.len() > 1024 * 1024 {
+    if request.len() > 768 * 1024 * 1024 || random.len() > 1024 * 1024 {
         return Err("Request exceeds limits");
     }
     let text = std::str::from_utf8(request).map_err(|_| "Invalid request")?;
@@ -26,7 +27,9 @@ pub fn execute(request: &[u8], random: Vec<u8>) -> Result<String, &'static str> 
     {
         return piv::execute(text, random);
     }
-    if parsed.0["op"]
+    if parsed.0["op"] == "store_catalog" {
+        index::software(text, random)
+    } else if parsed.0["op"]
         .as_str()
         .is_some_and(|op| op.starts_with("store_"))
     {
@@ -87,7 +90,7 @@ pub extern "system" fn Java_org_kagitaba_android_NativeBridge_execute(
         if env
             .get_array_length(&request)
             .map_err(|_| "Invalid request")?
-            > 96 * 1024 * 1024
+            > 768 * 1024 * 1024
             || env
                 .get_array_length(&random)
                 .map_err(|_| "Invalid randomness")?

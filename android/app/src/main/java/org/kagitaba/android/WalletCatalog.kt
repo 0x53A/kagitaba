@@ -27,7 +27,7 @@ class WalletCatalog(private val context: Context) {
     }
     @Synchronized fun add(name: String): String {
         val id = NativeBridge.random(16).joinToString("") { "%02x".format(it.toInt() and 255) }
-        state.getJSONArray("wallets").put(json("id" to id, "name" to name.trim().ifEmpty { "Wallet" }.take(128)))
+        state.getJSONArray("wallets").put(json("id" to id, "name" to name.ifEmpty { "Wallet" }))
         persist(); return id
     }
     @Synchronized fun select(id: String) {

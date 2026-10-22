@@ -1,3 +1,7 @@
+import {withBackupFlags} from './passkey-flags.mjs';
+import {entryMetadata} from './wallet-navigation.mjs';
+import {NativeGateway} from './native.mjs';
+import {PasskeyRouter} from './passkey-router.mjs';
 import {cryptoCall} from './crypto.mjs';
 import {uiDiagnostic} from './errors.mjs';
 import {GitReplica} from './git.mjs';
@@ -6,10 +10,16 @@ import {RemoteAuth} from './remote-auth.mjs';
 import {metadataPointers, isMetadata, decryptMetadata, pruneLegacy, renameParticipant} from './participant-metadata.mjs';
 import {encode, decode, random, hex, text, textBytes} from './encoding.mjs';
 import {validateRequest, matchesOrigin, originForSender, Epoch} from './policy.mjs';
-import {checkDraft} from './drafts.mjs';
+import {checkDraft, replaceEntry} from './drafts.mjs';
 
 const epoch = new Epoch();
+const native = new NativeGateway(browser);
+let backendMode = 'standalone';
+let nativeConfigured = false;
+const modeReady = browser.storage.local.get(['backendMode', 'nativeConfigured']).then(value=>{backendMode=value.backendMode==='native'?'native':'standalone';nativeConfigured=value.nativeConfigured===true||backendMode==='native';});
 const requests = new Map();
+const preflights = new Set();
+const router = new PasskeyRouter({api: browser, native, requests, currentDocument});
 let walletWindow;
 async function openWallet(tab) {
   if (walletWindow !== undefined) {
@@ -36,7 +46,7 @@ function autoSync(){
   automaticSyncQueued=true;
   setTimeout(()=>{serialize(async()=>{automaticSyncQueued=false;if(identity&&remoteAuth.public(replica.state.remote).autoSync)await synchronize();}).catch(()=>{});},0);
 }
-function publicStatus(){return {installation:publicInstallation(),unlocked:!!identity,replica:replica.state,lastSync:replica.state.lastSync??null,remoteAuth:remoteAuth.public(replica.state.remote),entries:metadata(),participants:publicParticipants()};}
+function publicStatus(){return {backendMode,installation:publicInstallation(),unlocked:!!identity,replica:replica.state,lastSync:replica.state.lastSync??null,remoteAuth:remoteAuth.public(replica.state.remote),entries:metadata(),participants:publicParticipants()};}
 function publicParticipants() {
   return Object.keys(files).flatMap(path => {
     const match = /^participants\/([0-9a-f]{64})\/pub.pem$/.exec(path);
@@ -45,13 +55,13 @@ function publicParticipants() {
   });
 }
 function locked() { if (!identity) throw new Error('Unlock Kagitaba first'); touched = Date.now(); }
-function lock(reason = 'lock') { identity = null;remoteAuth.clearSession(); entries.clear(); rawEntries.clear(); participantNames.clear(); supportedPasskeys.clear();epoch.invalidate(); for (const request of requests.values()) request.finish({error: 'Wallet locked'}); requests.clear(); browser.runtime.sendMessage({type: 'locked', reason}).catch(() => {}); }
+function lock(reason = 'lock') { for (const pending of preflights) pending.cancelled=true;native.cancel(); identity = null;remoteAuth.clearSession(); entries.clear(); rawEntries.clear(); participantNames.clear(); supportedPasskeys.clear();epoch.invalidate(); for (const request of requests.values()) request.finish({error: 'Wallet locked'}); requests.clear(); browser.runtime.sendMessage({type: 'locked', reason}).catch(() => {}); }
 function own(sender) {return sender.id === browser.runtime.id && sender.url?.split('?')[0] === browser.runtime.getURL('app.html');}
 function publicInstallation() {if (!installation) return null; const {envelope, ...publicData} = installation; return publicData;}
-function metadata() {return [...entries].map(([id, payload]) => ({id, title: payload.entity.title || id, kind: payload.kind}));}
+function metadata() {return entryMetadata(entries);}
 async function indexPasskeys(id,payload,current){
   for(const key of supportedPasskeys)if(key.startsWith(`${id}:`))supportedPasskeys.delete(key);
-  for(const credential of payload.entity.credentials??[]){if(credential.type!=='passkey')continue;try{await cryptoCall('passkey_validate',{privateKey:credential.key});}catch{continue;}epoch.check(current);supportedPasskeys.add(`${id}:${credential.credentialId}`);}
+  for(const credential of payload.entity.credentials??[]){if(credential.type!=='passkey')continue;try{await cryptoCall('passkey_validate',withBackupFlags({privateKey:credential.key},credential));}catch{continue;}epoch.check(current);supportedPasskeys.add(`${id}:${credential.credentialId}`);}
 }
 async function refresh(acceptedSnapshot) {
   const current = epoch.capture();
@@ -108,13 +118,11 @@ async function savePayload(id, payload, permitted = () => {}, expectedPrimary = 
   });
   let raw = typeof payload === 'string' ? payload : JSON.stringify(payload);
   if (changes) raw = (await cryptoCall('payload_edit', {entryId:id, payload:raw, changes})).payload;
+  await cryptoCall('validate_attachment_edit', {entryId:id,payload:raw,previousPayload:rawEntries.get(id)??null});
   epoch.check(current);
   const encrypted = await cryptoCall('entry_encrypt', {entryId: id, payload: raw, recipients: pems});
   epoch.check(current);
-  const next = await pruneLegacy(files, cryptoCall); epoch.check(current);
-  for (const path of Object.keys(next)) if (path.startsWith(`entries/${id}/`)) delete next[path];
-  next[`entries/${id}/primary`] = encrypted.primary;
-  for (const [recipient, grant] of Object.entries(encrypted.grants)) next[`${oldPrefix}${recipient}`] = grant;
+  const next = replaceEntry(await pruneLegacy(files, cryptoCall), id, encrypted); epoch.check(current);
   await replica.commit(next, () => {epoch.check(current);permitted();return identity;}, 'Update encrypted wallet entry');
   files = next;
   epoch.check(current); await refresh(next);
@@ -144,7 +152,7 @@ async function verifyHardware(prf) {
 }
 async function approve(message) {
   const request = requests.get(message.requestId);
-  if (!request) throw new Error('Request expired');
+  if (!request || request.phase !== 'browser') throw new Error('Request expired');
   if (message.fallback) {request.finish({fallback: true}); return true;}
   locked(); const current = epoch.capture();
   await currentDocument(request);
@@ -167,7 +175,7 @@ async function approve(message) {
   } else {
     const selected = passkeys(request).find(item => item.entryId === message.entryId && item.credential.credentialId === message.credentialId);
     if (!selected) throw new Error('Selected passkey is not permitted');
-    const signed = await cryptoCall('passkey_assert', {privateKey: selected.credential.key, rpId: request.rpId, clientDataJSON, uv: true});
+    const signed = await cryptoCall('passkey_assert', withBackupFlags({privateKey: selected.credential.key, rpId: request.rpId, clientDataJSON, uv: true},selected.credential));
     credential = {id: selected.credential.credentialId, response: {clientDataJSON, ...signed, userHandle: selected.credential.userHandle}, extensions: {}};
   }
   epoch.check(current); await currentDocument(request);
@@ -175,9 +183,24 @@ async function approve(message) {
   request.finish({credential}); return true;
 }
 async function handleUI(message) {
+  await modeReady;
+  if (message.type === 'backend-mode') {
+    if (!['native','standalone'].includes(message.mode)) throw Error('Unknown operation');
+    lock(); await browser.storage.local.set({backendMode:message.mode,nativeConfigured:nativeConfigured||message.mode==='native'}); backendMode=message.mode;nativeConfigured ||= message.mode==='native';return true;
+  }
+  if (message.type === 'native-cancel') {native.cancel(); return true;}
+  if (message.type === 'native-fill') {
+    if (backendMode !== 'native') throw Error('Unknown operation');
+    return native.fill(message.tabId);
+  }
+  if (message.type === 'lock') {lock(); return true;}
   await ready;
   if (message.type === 'status') return publicStatus();
-  if (message.type === 'lock') {lock(); return true;}
+  // The toolbar mode chooses a management screen, not the passkey backend.
+  // A configured browser wallet remains usable from its request approval window.
+  if (backendMode === 'native' && !['request', 'approve'].includes(message.type)
+      && !(message.type === 'unlock' && [...requests.values()].some(request => request.phase === 'browser')))
+    throw Error('Use the native client to manage the wallet');
   if (message.type === 'setup') {
     if (installation) throw new Error('This installation is already enrolled');
     const current = epoch.capture();
@@ -237,7 +260,7 @@ async function handleUI(message) {
   }
   if (message.type === 'request') {
     const request = requests.get(message.requestId);
-    if (!request) throw new Error('Request expired');
+    if (!request || request.phase !== 'browser') throw new Error('Request expired');
     return {id: request.id, kind: request.kind, origin: request.origin, rpId: request.rpId, username: request.input.user?.name, accounts: identity ? passkeys(request).map(item => ({entryId: item.entryId, credentialId: item.credential.credentialId, title: item.title})) : []};
   }
   if (message.type === 'approve') return approve(message);
@@ -258,28 +281,37 @@ async function handleUI(message) {
   throw new Error('Unknown operation');
 }
 browser.runtime.onMessage.addListener((message, sender) => {
-  if (own(sender)) return (['lock', 'status', 'request'].includes(message.type) ? handleUI(message) : serialize(() => handleUI(message))).catch(error => {const detail = uiDiagnostic(error); console.warn(`[Kagitaba] ${detail}`); throw new Error(detail);});
+  if (own(sender)) return (['lock', 'status', 'request', 'native-fill', 'native-cancel'].includes(message.type) ? handleUI(message) : serialize(() => handleUI(message))).catch(error => {const detail = uiDiagnostic(error); console.warn(`[Kagitaba] ${detail}`); throw new Error(detail);});
   if (message.type === 'cancel') {
+    if(sender.frameId===0)for(const pending of preflights)if(pending.pageId===message.id&&pending.tabId===sender.tab?.id&&pending.documentToken===message.documentToken)pending.cancelled=true;
+    if(sender.frameId===0)native.cancelPage(sender.tab?.id,message.id,message.documentToken);
     for (const request of requests.values()) if (request.pageId === message.id && request.tabId === sender.tab?.id && request.documentToken === message.documentToken) request.finish({error: 'Request cancelled'});
     return Promise.resolve(true);
   }
+  if (message.type === 'passkey-choice') return router.choose(message, sender).catch(() => false);
   if (message.type !== 'webauthn') return undefined;
-  return ready.then(() => {
+  const pending={pageId:message.id,tabId:sender.tab?.id,documentToken:message.documentToken,cancelled:false};
+  // Bound setup work too, before asynchronous storage initialization completes.
+  if(sender.frameId!==0||typeof message.id!=='string'||message.id.length>80||typeof message.documentToken!=='string'||preflights.size>=8)return Promise.resolve({error:'Request unavailable'});
+  preflights.add(pending);
+  return Promise.all([ready,modeReady]).then(() => {
+    if(pending.cancelled)return {error:'Request cancelled'};
     let request;
     try {if(JSON.stringify(message.input).length>65536)throw new Error('Request too large');request = validateRequest(message.kind, message.input, sender);} catch {return {fallback: true};}
-    if (!installation || !replica.state.head || requests.size >= 8 || [...requests.values()].some(r=>r.tabId===sender.tab.id) || typeof message.documentToken !== 'string') return {fallback: true};
+    if (requests.size >= 8 || [...requests.values()].some(r=>r.tabId===sender.tab.id)) return {error:'Another passkey request is pending'};
+    const backends=[];
+    if(installation&&replica.state.head)backends.push('browser');
+    if(nativeConfigured)backends.push('native');
+    if(!backends.length)return {fallback:true};
     const id = hex(random(16));
-    return new Promise(resolve => {
-      const timer = setTimeout(() => finish({error: 'Request expired'}), request.timeout);
-      const finish = result => {clearTimeout(timer); requests.delete(id); resolve(result);};
-      requests.set(id, {...request, id, pageId: message.id, documentToken: message.documentToken, tabId: sender.tab.id, finish});
-      browser.windows.create({url: browser.runtime.getURL(`app.html?request=${id}`),type:'popup',width:480,height:640}).then(window=>{const pending=requests.get(id);if(pending)pending.windowId=window.id;else browser.windows.remove(window.id).catch(()=>{});}).catch(() => finish({error: 'Unable to open approval'}));
-    });
-  });
+    preflights.delete(pending);
+    return router.start({...request, id, pageId: message.id, documentToken: message.documentToken, tabId: sender.tab.id},backends);
+  }).finally(()=>preflights.delete(pending));
 });
 browser.browserAction.onClicked.addListener(tab => openWallet(tab).catch(()=>{}));
-browser.windows.onRemoved.addListener(windowId=>{if(walletWindow===windowId)walletWindow=undefined;for(const request of requests.values())if(request.windowId===windowId)request.finish({error:'Request cancelled'});});
-browser.webNavigation.onCommitted.addListener(details => {if (details.frameId === 0) for (const request of requests.values()) if (request.tabId === details.tabId) request.finish({error: 'Website navigated'});});
-browser.tabs.onRemoved.addListener(tabId => {for (const request of requests.values()) if (request.tabId === tabId) request.finish({error: 'Website closed'});});
+browser.windows.onRemoved.addListener(windowId=>{if(walletWindow===windowId){walletWindow=undefined;native.cancel();}for(const request of requests.values())if(request.windowId===windowId)request.finish({error:'Request cancelled'});});
+browser.webNavigation.onBeforeNavigate.addListener(details=>{if(details.frameId===0){for(const pending of preflights)if(pending.tabId===details.tabId)pending.cancelled=true;native.cancel(details.tabId);for(const request of requests.values())if(request.tabId===details.tabId)request.finish({error:'Website navigated'});}});
+browser.webNavigation.onCommitted.addListener(details => {if(details.frameId===0)native.cancel(details.tabId);if (details.frameId === 0) for (const request of requests.values()) if (request.tabId === details.tabId) request.finish({error: 'Website navigated'});});
+browser.tabs.onRemoved.addListener(tabId => {for(const pending of preflights)if(pending.tabId===tabId)pending.cancelled=true;native.cancel(tabId);for (const request of requests.values()) if (request.tabId === tabId) request.finish({error: 'Website closed'});});
 browser.alarms.create('lock', {periodInMinutes: 1});
 browser.alarms.onAlarm.addListener(() => {if (identity && Date.now() - touched >= 5 * 60 * 1000) lock();});

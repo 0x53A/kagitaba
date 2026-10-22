@@ -20,7 +20,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod attachments;
+pub mod password;
+pub mod otp;
 pub mod bitwarden;
+pub mod firefox;
 mod conversion;
 mod document;
 mod import;
@@ -30,7 +34,7 @@ pub mod keepass;
 mod payload;
 mod participant;
 
-pub use conversion::{Conversion, ConversionReport, ImportWarning, WarningKind};
+pub use conversion::{Conversion, ConversionReport, ImportWarning, SourceAttachment, WarningKind, WarningDetail};
 pub use credential_exchange_format as model;
 pub use document::{Document, MAX_DOCUMENT_BYTES};
 pub use import::{ImportPlan, ImportReport};
@@ -49,6 +53,9 @@ pub enum Error {
     /// A caller-provided input stream could not be read.
     #[error("could not read credential input")]
     Read,
+    /// A caller-provided attachment staging sink could not be written.
+    #[error("could not write attachment staging output")]
+    Write,
     /// Malformed JSON, duplicate object members, or invalid CXF structure.
     #[error("invalid credential document")]
     InvalidDocument,
@@ -58,6 +65,9 @@ pub enum Error {
     /// Encrypted CXP is a protocol response, not plaintext CXF.
     #[error("CXP response requires its exchange session and protocol decoder")]
     CxpSessionRequired,
+    /// Plain CXF JSON has no transport for owner-bound Kagitaba attachment blobs.
+    #[error("owned Kagitaba attachments require a wallet backup; plain CXF imports cannot carry their file data")]
+    OwnedAttachmentsUnsupported,
     /// A bounded input or payload limit was exceeded.
     #[error("credential document exceeds a size or nesting limit")]
     SizeLimit,

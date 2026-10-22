@@ -28,11 +28,11 @@ export XDG_CONFIG_HOME="$preview_tmp/config"
 export XDG_RUNTIME_DIR="$preview_tmp"
 export LIBGL_ALWAYS_SOFTWARE=1
 mkdir -p target/ui-preview
-for scene in home wallet create provision touch unlock import review keys transfer; do
+for scene in ${KAGITABA_PREVIEW_SCENES:-home wallet provision touch attachments index-preview create create-ready-new create-created enrollment unlock import review keys transfer generator totp import-item import-item-details import-item-history custom-fields urls passkey access}; do
     KAGITABA_SMOKE_SCENE="$scene" EFRAME_SCREENSHOT_TO="$PWD/target/ui-preview/$scene.png" \
         ./target/debug/kagitaba-app
 done
-for scene in home wallet provision touch unlock review; do
+for scene in ${KAGITABA_PREVIEW_SCENES:-home wallet provision touch attachments index-preview unlock review create enrollment keys transfer generator totp import-item import-item-details import-item-history custom-fields urls passkey access}; do
     KAGITABA_SMOKE_NARROW=1 KAGITABA_SMOKE_SCENE="$scene" \
         EFRAME_SCREENSHOT_TO="$PWD/target/ui-preview/$scene-narrow.png" ./target/debug/kagitaba-app
 done

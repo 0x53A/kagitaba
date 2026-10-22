@@ -1,11 +1,13 @@
 export const encode = bytes => {
-  let value = '';
-  for (const byte of new Uint8Array(bytes)) value += String.fromCharCode(byte);
-  return btoa(value).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+  const input = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes), parts = [];
+  for (let i=0;i<input.length;i+=32768) parts.push(String.fromCharCode(...input.subarray(i,i+32768)));
+  return btoa(parts.join('')).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
 };
 export const decode = value => {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-]*$/.test(value)) throw new Error('Invalid binary encoding');
-  return Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/')), c => c.charCodeAt(0));
+  const binary = atob(value.replaceAll('-', '+').replaceAll('_', '/')), bytes = new Uint8Array(binary.length);
+  for (let i=0;i<bytes.length;i++) bytes[i]=binary.charCodeAt(i);
+  return bytes;
 };
 export const random = size => crypto.getRandomValues(new Uint8Array(size));
 export const textBytes = value => new TextEncoder().encode(value);

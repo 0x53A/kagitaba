@@ -1,6 +1,8 @@
 // Never forward library messages, URLs, response bodies, or request arguments.
 // Only fixed diagnostics may cross the privileged UI boundary or enter logs.
 const messages = new Set([
+  'Native request denied or unavailable. Open and unlock the native client, then retry.',
+  'Use the native client to manage the wallet',
   'This entry changed or was deleted. Reopen it before saving; your draft has been kept.',
   'Unknown wallet participant', 'Invalid participant name',
   'No remote configured', 'Invalid remote credentials',

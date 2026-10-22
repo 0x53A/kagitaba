@@ -10,13 +10,19 @@ into this native application is storage, not registration as an OS authenticator
 ## Design pattern
 
 Rectangular controls, near-black background, dark blue surfaces, pale text and
-cyan primary actions. Readable 16px body text, hairline separation and
+cyan primary actions. Proportional 16px interface text, muted 13px field labels and
+secondary instructions, 18px subsection titles and 25px page headings. Credential
+values and fingerprints use explicit monospace; warnings retain distinct color.
+Scrollable areas show solid, nonfading scrollbars when content overflows; areas
+that fit show no scrollbar. Native system pickers follow desktop settings. Hairline separation and
 no rounded corners or shadows. `theme.rs` owns the visual language.
+URL editing uses one URLs table: single-line inputs with Copy and remove on the
+right, followed by a full-width dashed + URL control. No repeated row labels.
 Android and Firefox share these roles and task-focused navigation. Keep copy
 concise, retaining instructions needed for trust, access and destructive actions.
 
-The welcome screen contains Open wallet, Create wallet, the opt-in Remember opened
-wallets checkbox, then favorites above recent wallets. Stars toggle favorites;
+The welcome screen contains Open wallet, Create wallet and Create enrollment bundle, then the opt-in Remember opened
+wallets checkbox, then favorites above recent wallets. Saved locations use contiguous split buttons with colored star and remove actions. Stars toggle favorites;
 the X removes only a saved location, never wallet files or trust records.
 Disabling history immediately clears recents, including persisted recents.
 Explicit favorites survive history opt-out. Only successfully verified/opened
@@ -27,15 +33,40 @@ paths/preferences, never credentials, titles, PINs or trust decisions. Linux pat
 bytes are hex encoded to preserve non-UTF8 paths; this is not encryption.
 
 Opening chooses a folder, verifies trust/history, then offers detected or manual
-participant/device/slot selection. Unlock & load entry names explicitly decrypts
-titles into memory. A locked wallet can browse encrypted IDs and make backups.
-Create chooses a folder first, prepares a key, then explicitly creates/signs.
+participant/device/slot selection. Unlock explicitly loads the search index. Unlock and new-key enrollment are separate flows.
+Create opens the form directly, with an editable location and folder chooser,
+then prepares a key and explicitly creates/signs. The header orders brand, wallet
+name, fetch state and refresh, with tools and a colored close button at the right.
+The wallet's favorite toggle is a star icon in that right-hand header group.
+The PIV PIN field includes its arrow action inside the right edge; Enter in the
+focused field submits the same action. Empty/disabled input and absent devices
+cannot submit, and successful preparation disables further PIN submission.
 The wallet workspace has an entry list on the left and details on the right;
 below 780pt available width, details use a scrollable modal with Close and Lock.
 Import (source, preview/recipients, completion), Keys & access, and Backups & updates
 are separate screens with Back. Lock remains available during work and in the
 details modal. Closing a wallet waits for the worker to drop its store and session.
 Unsaved entry edits prompt before navigation; locking always clears immediately.
+Entry lists sort loaded titles alphabetically (case-insensitive), then encrypted
+entries by ID. Search matches indexed titles, account names, URLs/scopes or entry IDs, trims surrounding spaces,
+and offers Clear / Escape while focused plus result counts and no-match feedback.
+The list caches normalized search text, sorted order and filtered results until
+its data/query changes, and only renders visible rows. Lock drops these caches.
+Selecting an entry shows only its current participant-index summary: title,
+usernames, scopes and password/TOTP/passkey presence. Show more explicitly decrypts
+and opens the editable payload. Selection itself sends no private operation.
+Index summaries are bound to the verified snapshot and unlocked participant;
+snapshot replacement and lock clear them. Android scopes display application IDs
+and available names/certificate fingerprints; scope text is selectable without
+opening links. Presence flags remain hints, not activation or authorization.
+Selecting the current entry preserves its draft without another hardware request.
+Editors put Save / Discard and saved/unsaved state above the fields; unchanged
+entries cannot be saved redundantly.
+Discard edits asks for confirmation, restores the loaded payload and recipients
+without decryption, and clears widget undo/reveal state. Discarding a new draft
+closes it. Deletion of saved entries is grouped in an expandable section and
+retains explicit confirmation; it opens by default for inaccessible entries.
+
 New entries initially select only the current enrolled participant. Enrollment
 does not imply entry access. Raw CXF editing remains an explicit advanced option.
 
@@ -44,7 +75,9 @@ expire their clipboard contents after 30 seconds only if
 the contents still match. Manual selection/copy in the advanced editor and system
 clipboard history are outside that guarantee. Complete CXF JSON is an explicit reveal/edit panel for unsupported
 fields, provenance and collection links. No external resource URLs are fetched.
-File dialogs render in process using egui-file-dialog; no external dialog command.
+File dialogs default to the native system portal through the `native-dialog` Cargo
+feature. Build with `--no-default-features` to use floating in-window egui-file-dialog
+choosers. Native dialogs run off the UI thread; locking discards late selections.
 
 ## Hardware workflow
 
@@ -54,6 +87,16 @@ no ykman, libusb, PC/SC or OpenSSL is linked or spawned by the application.
 OS windowing, graphics, clipboard and USB interfaces remain platform boundaries.
 Other programs holding the CCID interface must release it. USB permissions are
 provided by the OS; the app never changes system rules or detaches another owner.
+
+Creation and enrollment first verify the PIN once, then inspect all retired slots.
+Use existing slots is enabled when at least two usable P-256 slots are detected;
+this detects compatible keys, not Kagitaba provenance. Otherwise new-slot enrollment
+is selected. The authenticated device connection remains in the worker, without
+retaining the PIN, until an explicit create/use action or lock/close/refresh.
+Slot selection does not generate keys. Create keys requires management authentication
+and explicit consent for the selected slots; Create wallet becomes available after
+success. The enrollment workflow exports public participant JSON independently
+of creating or opening a wallet.
 
 Setup explicitly generates P-256 keys in two selectable, distinct retired PIV
 key-management slots from 0x82–0x95, defaulting to 0x82 (ECDH) and 0x83 (ECDSA
@@ -152,8 +195,27 @@ remain supported and are not converted automatically. Normal clones also work.
 Logical files live in committed trees:
 `kagitaba-format` (version 1), `participants/<id>/pub.pem`,
 `participants/<id>/sign.pem`, `entries/<id>/primary`,
-`entries/<id>/grants/<recipient-id>`. Public keys are SPKI PEM. No combined catalog
-or plaintext title cache is persisted. The accepted branch is `refs/heads/wallet`.
+`entries/<id>/grants/<recipient-id>`. Public keys are SPKI PEM. The participant's
+encrypted catalogue is `cache/<participant-id>/index`; its separately retained
+wrapped key is `participants/<participant-id>/index-key`. No plaintext catalogue
+is persisted. The accepted branch is `refs/heads/wallet`. See `../../INDEX-FORMAT.md`.
+
+Unlock unwraps the participant's index key once and decrypts the catalogue. Missing
+or stale rows are rebuilt from accessible entries; only new/changed own grants or
+primaries require entry decryption. Cache-only and other-recipient grant changes
+do not invalidate rows. The decoded index and key stay in the worker only while
+unlocked; lock/close/replacement clears them. Titles, accounts and scopes go to the
+UI as search hints, while opening/using a credential decrypts its authoritative
+entry again. Native passkey matching uses a current index to skip unrelated RPs.
+
+Genesis and native enrolment provision participant index keys. Index refreshes
+batch with normal signed writes, or use a separate signed cache update after an
+unlock/rebuild; a PIV touch may therefore be needed the first time. Unchanged
+indexes do not cause another commit. A failed cache update retains useful session
+rows and reports an advisory. Failed extraction removes the disposable own cache
+from requested authoritative writes and falls back to readable titles; it never
+regenerates an existing wrapped index key. Reader updates in browser and Android
+must ship with these writers; older standalone clients reject the new paths.
 
 Wallet reads always verify committed bytes, ignoring index and working-tree
 contents. Writes and accepted updates refresh both the encrypted working files and
@@ -232,14 +294,82 @@ Rust cryptography boundary and does not perform wallet signing/verification.
 App backup copies retain original
 signatures and never copy private keys or the device-local trust directory.
 
+## Immutable file attachments
+
+After Show more, saved entries have Attachments with Add file, Rename, Save as and Remove. Rename changes the encrypted display name
+only, creating a signed primary revision while retaining the original attachment
+blob and recipient set.
+Files are immutable and owned exclusively by their parent entry; no sharing a file
+between entries or inline file editing. Mutations require a clean saved draft and
+sign immediately. New entries must be saved before adding files. Native authoring
+is implemented in this checkout. Firefox and Android source readers/mutation
+safeguards preserve compatible attachments, but do not provide this file picker
+workflow; browser recipient reductions with owned files require the native client.
+Installed artifacts are separate: the previously signed Firefox 0.1.2 XPI predates
+attachment support and must not be treated as an upgraded reader.
+
+Encrypted bytes live in the signed Git wallet under the owner's attachments path,
+as specified in `../../ATTACHMENT-FORMAT.md`. Each file is bounded to 64 MiB and
+has a fresh content key. Added files inherit the parent's existing recipients.
+Reducing recipients or revoking a participant rotates every retained attachment's
+key and blob revision along with the parent payload. Ordinary entry edits must
+preserve the attachment manifest exactly; use dedicated Add/Remove actions.
+Removing an entry prunes its blobs, while signed history retains historical copies.
+
+Picker callbacks recheck the selected owner, parent digest and clean/unlocked UI;
+the worker also checks the accepted wallet head and parent digest. Lock, entry
+replacement and cancelled work invalidate the action token. Signing checks that
+token before and after private operations. A signed write already completed when
+cancellation arrives remains stored, consistent with other wallet operations.
+
+Add and rekey stream one chunk at a time from disk/Git into private encrypted
+staging. Snapshots retain lazy blob references rather than attachment bytes;
+cloning a snapshot does not clone file contents. Save as streams plaintext into
+a private temporary destination and verifies every chunk, total size, final hash
+and EOF before publication. The worker publishes a mode-0600 file atomically and refuses to
+replace an existing destination, even after a picker overwrite confirmation.
+Choose a new name to export again. Plaintext export staging is in the selected
+destination folder; encrypted add/rekey staging uses private temporary files.
+Both are cleaned up on ordinary failure/cancellation. A process crash can leave
+a private staging file. Encrypted staging and committed wallet files contain
+ciphertext; plaintext export is written only to the chosen destination. No file
+is opened automatically. Physical-key attachment validation remains pending.
+
 ## Imports and secret handling
 
-Preview unencrypted Bitwarden JSON, plaintext CXF or encrypted KeePass databases
-(optional password component, including an empty password, and optional key file), review non-secret warning categories, choose
-recipients, then encrypt and sign. No import writes a plaintext intermediate.
+Preview Firefox password CSV exports, unencrypted Bitwarden JSON, plaintext CXF or encrypted KeePass databases
+(optional password component, including an empty password, and optional key file).
+Every import is wrapped in a collection named after the source filename, with
+existing collection trees embedded and their provenance preserved. The optional
+Save original file as an entry checkbox is off initially and stores the unchanged
+selected source file as an owned encrypted attachment, granted to the chosen import
+recipients. It does not include a separate KeePass key file. The review defaults to
+Skip N existing duplicates: exact readable item contents are compared, ignoring
+newly generated IDs and attachment encryption randomness, while retaining source
+provenance and unknown data. Verified equal attachments can match; unreadable
+entries are counted without guessing their kind. Skipped copies link to existing
+survivors and missing selected-recipient grants are added in the same signed update.
+
+The review lists planned items and collections, with custom fields and preserved
+source data available before import. Source account counts refer to CXF export
+containers, not website logins. Custom-field counts count credential groups;
+history warnings count source items with history, not historical revisions.
+Preserved custom-field groups list distinct fieldType names and individual field
+counts underneath the group total; labels and values are not included in that summary.
+Detailed KeePass warnings identify the affected entry, known field, rejection
+reason and next step. Inspect fields expands and scrolls to its masked preview;
+source values are never included in diagnostic messages. Ordinary non-HTTP URL
+strings remain catalogue data, with provider checks still required for use.
+Choose recipients, then encrypt and sign. No import writes a plaintext intermediate.
 Imported root collections remain atomic CXF payloads. Advanced JSON edits preserve
 unknown fields and imported provenance. Original export files remain untouched.
-Attachments are not copied, and opaque passkeys remain inactive source metadata.
+KeePass active attachments are extracted separately from JSON and encrypted into
+private staging before preview. Import publishes each file under its remapped
+entry owner with the same recipients as the entry, in the same signed update.
+Invalid names, missing owners and file limits fail explicitly; no partial import
+is committed. Bitwarden/CXF external references without bytes remain omissions.
+Opaque passkeys remain inactive source metadata. Preview values and source/history
+JSON use zeroizing storage, reveal explicitly and are dropped on lock/navigation.
 
 Operations run on a worker thread. UI clears its secret state on lock, after five
 minutes without input, and when replacing the wallet snapshot. Results of pending
@@ -248,7 +378,8 @@ wallet metadata updates still track the worker's accepted snapshot. Timeout
 clearing is immediate even while the worker is busy; only the worker's explicit
 lock completion releases suppression. A hardware operation already
 submitted may finish before the queued lock; lock is not transaction cancellation.
-Title decryption is explicit and kept in memory. Editor widget IDs include the
+Index decryption follows explicit unlock; decrypted rows are kept only in memory.
+Editor widget IDs include the
 entry and replacement epoch; text undo state is discarded on entry/snapshot
 replacement and lock. Encrypted entries can be selected and deleted even if
 decryption fails; saving and grant changes require a decrypted payload.
@@ -257,7 +388,8 @@ copies that do not all offer guaranteed wiping. Do not claim process-compromise
 resistance or complete RAM/swap erasure.
 
 SHA-1/256/512 TOTP generation is checked against RFC 6238 vectors. New passwords
-use 24 uniform random characters from a 64-character alphabet (144 random bits).
+use the shared configurable generator, defaulting to 12 lowercase/digit characters
+with lookalike exclusions.
 Changing a saved password never changes the password at the website.
 
 Tests use synthetic credentials and temporary repositories. The optional `smoke`
@@ -267,7 +399,7 @@ XDG data directories and synthetic wallets for smoke tests. No source checkout
 commits or staging are performed by development checks; temporary wallet histories
 are created by tests.
 
-With `smoke`, `KAGITABA_SMOKE_SCENE=home|wallet|create|provision|touch|unlock|import|review|keys|transfer`
+With `smoke`, `KAGITABA_SMOKE_SCENE=home|wallet|attachments|index-preview|create|provision|touch|create-ready-new|create-created|enrollment|unlock|import|review|keys|transfer`
 loads synthetic, disconnected UI fixtures (no hardware/credential reads or worker
 writes). `KAGITABA_SMOKE_NARROW=1` selects a 440×780 viewport. Combine with
 `EFRAME_SCREENSHOT_TO=/absolute/path.png` in a virtual display. These switches
@@ -284,3 +416,159 @@ software passkey and HTTPS Git support. Collection membership and nesting
 currently use the complete CXF editor; a dedicated collection organizer is not
 implemented. Attachment handling and unsupported passkeys retain the documented
 import limitations.
+
+## Firefox native gateway
+
+The normal Linux executable also acts as Firefox's native messaging host when
+Firefox supplies its manifest path and `firefox@kagitaba.local` caller argument.
+This mode runs before the GUI/instance lock and performs no wallet operations.
+Register a built executable with
+`uv run --no-project tools/install_native_host.py /absolute/path/kagitaba-app`.
+This writes `~/.mozilla/native-messaging-hosts/kagitaba.json`; the manifest allows
+only that extension ID. Development builds can use `target/debug/kagitaba-app`.
+The native GUI must already be running with an open, unlocked wallet.
+
+The GUI listens at `$XDG_RUNTIME_DIR/kagitaba/browser.sock`. Both the runtime
+root and Kagitaba directory must be real, current-user-owned private directories;
+the child is created 0700 and the socket is 0600. No /tmp or TCP fallback exists.
+A held lock in the private directory prevents concurrent listeners even with
+separate XDG data directories. Stale sockets are removed only after validating
+type/owner/permissions and receiving ConnectionRefused. Other invalid paths fail
+closed without disabling ordinary wallet use. The bridge validates the same
+paths. Socket permissions isolate OS users, not hostile processes running as the
+same user; caller arguments and claimed website origins are not cryptographic
+browser attestation. Native UI approval remains required for every release.
+
+Version 1 is a one-request connection: four-byte native-endian length followed
+by UTF-8 JSON, bounded to 64 KiB in both directions. Request:
+`{"version":1,"operation":"login","origin":"https://example.com"}`.
+Success returns version, username and password; failure is a fixed error.
+Only canonical HTTPS origins are accepted. The UI displays the origin, offers
+entry selection and requires Approve and fill. The worker decrypts only that
+entry and requires an exact HTTPS-origin match in CXF scope.urls, excludes
+participant metadata and returns only the first basic-auth credential. It never
+returns full payloads or keys.
+
+The Native Messaging bridge relays frames unchanged, without JSON or operation
+parsing. The native endpoint also accepts
+`{"version":1,"operation":"passkey","origin":"https://example.com","kind":"create","input":{...}}`
+(and `kind: "get"`), using the extension's base64url WebAuthn option encoding.
+It independently validates RP suffix/public-suffix restrictions, challenge and
+credential bounds and supported options. ES256 only; PRF, platform-only and
+enterprise requests are unsupported. Native approval and a fresh single-attempt
+PIV PIN verification precede each registration/assertion (UV); touch alone is not
+UV. PIN failure clears the session. Matching accounts are decrypted on explicit
+request; their labels and PIN drafts clear on cancellation/lock. Assertions use
+zero counters and exact rpId matching. The app reuses kagitaba-browser's portable
+ES256 primitives; passkey private keys stay native.
+
+Registration encrypts a new CXF item for the current participant, completes
+metadata grants and saves signed history plus trust before returning success.
+Sharing with other participants remains explicit native wallet work. Cancellation
+is checked before/after hardware operations and before/after signing. A signed
+write already completed when cancellation arrives remains stored, but its response
+is suppressed. There is no general list/edit API, TOTP or phone transport.
+
+Requests expire after 90 seconds. Closing the native port propagates EOF to the
+socket; cancellation/expiry, lock, wallet replacement and changed accepted heads
+suppress pending responses. Secret worker results pass through the UI lock gate.
+Requests do not refresh idle activity; explicit native approval does. Existing
+zeroization limitations apply to JSON serialization and browser copies.
+
+Synthetic tests cover framing bounds, exact-origin matching, private-directory
+validation, exclusive listeners, real socket replies/disconnects/denials and
+late secret suppression after lock, snapshot changes, cancellation and expiry.
+Passkey tests encrypt registrations and independently verify assertion signatures,
+RP binding, UV flags, zero counters, exclusions and cancellation. Device tests
+exercise explicit PIN reverification failures and recovery. Physical PIV plus
+browser/native approval still needs end-to-end hardware validation.
+
+
+## Credential tools and field parity
+
+See `../../FIELD-AND-GENERATOR-DESIGN.md` for the shared behavior. Header Tools
+opens the standalone generator; each login supports Generate… and explicit
+application to its draft. TOTP imports accept camera, PNG/JPEG and pasted URI,
+reviewed before adding/saving. Linux camera capture uses ffmpeg on PATH, a bounded
+local /dev/video stream and an in-memory preview; the project shell supplies it.
+No camera is opened until explicitly requested. Locks and entry replacement clear
+tool state and cancel scans. All data fields use bundled DejaVu Sans Mono.
+TOTP storage permits positive u64 periods/digits; generation remains explicitly
+limited to supported algorithms/digits. Ordinary URLs are never scheme-gated.
+
+The Nix shell provides libdbus for rfd's dynamic portal backend and embeds its
+runtime library path in local builds. An empty/disconnected native chooser result
+clears the pending action and reports that selection was cancelled or unavailable.
+Matching a saved participant on the unlock screen queues one-time PIN focus;
+password dots use vertically centered text alignment. Header favorites sit directly
+left of Close, sync state uses small muted text, and index preview values have
+stronger hierarchy than labels and IDs.
+
+Custom-field editing supports named `string`, `concealed-string`, and `boolean`
+values. A label equal to PIN (case-insensitive, ignoring surrounding whitespace)
+is concealed by default even when stored as `string`; reveal is explicit and
+display policy never rewrites the stored field type. Edits preserve unknown field
+metadata and unsupported field types. Boolean values remain CXF `"true"`/`"false"`
+strings. Unknown fields remain available in the preserved payload.
+
+## Collection navigation
+
+See `../../COLLECTIONS-DESIGN.md`. All entries is the initial filter, followed by
+Entries not in a collection and the readable collection tree. The participant
+index supplies names, direct members and nested nodes; changing these filters
+performs no read/decrypt command. Unfiled excludes membership across all readable
+indexed nodes, including descendants; inaccessible collections cannot contribute
+known membership. Missing/inaccessible/external links remain preserved and are
+counted as unavailable. Edit collection explicitly opens the owning root record.
+Lock and wallet replacement clear navigation selection. Wide screens use tree,
+entries and details columns; medium screens retain tree/list with modal details;
+compact screens use a collapsible tree above the list. Entry rows show cached
+usernames and smaller muted abbreviated IDs, with the full ID available on hover.
+
+Native discrete mouse-wheel scrolling uses 100 logical points per line (2.5×
+egui's native default) across app views. Precise touchpad point deltas and
+page-scroll input keep their original scaling.
+
+Passkey details are readonly: RP, username/display name, credential ID and a
+concealed, explicitly revealable user handle. Copy uses the normal timed clipboard
+policy. Backup flags show their recorded values, or Not recorded when absent;
+these labels do not infer registration state. ES256 / P-256 is shown only after
+validating the stored PKCS#8 key as P-256; other keys display Unknown. The normal
+view never displays the private key. Keys & access presents an unlocked device
+as readonly name/serial, status and active slots; saved routing replaces the
+Remember device action with a status label.
+
+## Copy and duplicate cleanup
+
+See `../../COPY-AND-DEDUPLICATION.md`. Tools exposes exact duplicate cleanup and
+multi-entry copying between already trusted Kagitaba wallets. Destination keys
+are independently verified, with a separate PIN unlock when the current key is
+not enrolled there. Source-key authority never substitutes for target membership.
+Source and destination hardware sessions are not held simultaneously during a
+key switch. Copy review remains idle-lockable while only the target key is open.
+
+Duplicate matching compares current credential content across importers. Known
+source/history metadata and source timestamps are retained in a bounded encrypted
+provenance archive when combining entries; unknown active data still participates
+in equality. New provenance requires resealing the survivor to its complete union
+of recipients. Exact reimports with no new provenance preserve primary bytes.
+See COPY-AND-DEDUPLICATION.md for normalization and failure behavior.
+
+## Manage access
+
+Tools and Keys & access expose Manage access for an already enrolled participant.
+Choose the participant, then preview all readable credential and collection entries:
+new grants, already granted, and unavailable. Grant access and sign adds the
+previewed grants in one signed update, preserving primary records, existing grants,
+and attachment blobs. It does not revoke access or provision a device. Participant
+metadata retains its existing all-participants policy. The backend binds review to
+wallet head, current key and target; stale review is refused. Target changes,
+navigation, wallet replacement and lock discard review; late preview events are
+ignored. Synthetic tests cover atomic grant preservation and review lifecycle;
+physical-key validation remains pending.
+
+Entry summaries and decrypted details show Collections with one root-to-node
+path per direct membership, derived from readable collection index hints. Ancestor
+names provide the path, not implied parent membership. Multiple roots and nested
+memberships are retained; inaccessible collections are not inferred. This display
+requires no additional key operation and does not authorize access.

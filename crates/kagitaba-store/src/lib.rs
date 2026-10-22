@@ -1,29 +1,30 @@
 //! Signed Git wallet storage with conservative merges. No working tree is trusted or decrypted.
 #![forbid(unsafe_code)]
+mod blob;
+pub use blob::AttachmentBlob;
 mod device_hint;
 mod history;
-mod participant_name;
-mod metadata;
 #[cfg(test)]
 mod history_tests;
+pub mod index;
+mod metadata;
+mod participant_name;
 mod signing;
 mod transfer;
 mod worktree;
 pub use device_hint::DeviceHint;
-pub use participant_name::validate_name;
-use history::{history, merge_files, verify_history};
-use gix::{
-    objs::{
-        WriteTo,
-        tree::{Entry as TreeEntry, EntryKind},
-    },
-};
 pub use gix::ObjectId;
+use gix::objs::{
+    WriteTo,
+    tree::{Entry as TreeEntry, EntryKind},
+};
+use history::{history, merge_files, verify_history};
 use kagitaba_core::{
     EntryId, KeyId,
     crypto::PublicKey,
     wallet::{Entry, GrantRecord, PrimaryRecord, Wallet},
 };
+pub use participant_name::validate_name;
 pub use signing::{Signer, ssh_public};
 use std::{
     collections::BTreeMap,
@@ -56,15 +57,21 @@ pub enum Error {
     Signature,
     #[error("unsupported wallet history; update clients if this wallet uses newer history rules")]
     History,
-    #[error("incoming history does not contain the trusted checkpoint; histories diverged or an older snapshot was offered")]
+    #[error(
+        "incoming history does not contain the trusted checkpoint; histories diverged or an older snapshot was offered"
+    )]
     Checkpoint,
     #[error("wallet histories have different genesis commits and cannot be merged")]
     UnrelatedHistory,
     #[error("wallet histories have multiple merge bases; automatic merging is unsupported")]
     AmbiguousMergeBase,
-    #[error("participant name must be 1–128 characters, at most 512 bytes, with no surrounding whitespace, controls or bidirectional overrides")]
+    #[error(
+        "participant name must be 1–128 characters, at most 512 bytes, with no surrounding whitespace, controls or bidirectional overrides"
+    )]
     InvalidName,
-    #[error("wallet histories conflict; concurrent entry or participant changes require manual resolution")]
+    #[error(
+        "wallet histories conflict; concurrent entry or participant changes require manual resolution"
+    )]
     Conflict,
     #[error("wallet changed in another process; reload before saving")]
     Stale,
@@ -81,6 +88,12 @@ pub struct HistoryRelation {
 }
 #[derive(Clone)]
 pub struct Snapshot {
+    /// Immutable encrypted files owned by one entry, outside its primary payload.
+    pub attachments: BTreeMap<EntryId, BTreeMap<String, AttachmentBlob>>,
+    /// Participant-owned wrapped index keys, authoritative and retained on cache invalidation.
+    pub index_keys: BTreeMap<KeyId, Vec<u8>>,
+    /// Disposable encrypted indexes. Invalid ciphertext is rebuilt after unlock.
+    pub indexes: BTreeMap<KeyId, Vec<u8>>,
     pub wallet: Wallet,
     pub signers: BTreeMap<KeyId, PublicKey>,
     pub devices: BTreeMap<KeyId, DeviceHint>,
@@ -94,6 +107,9 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn empty(encryption: PublicKey, signing: PublicKey) -> Result<Self> {
         Ok(Self {
+            attachments: BTreeMap::new(),
+            index_keys: BTreeMap::new(),
+            indexes: BTreeMap::new(),
             metadata: BTreeMap::new(),
             names: BTreeMap::new(),
             devices: BTreeMap::new(),
@@ -102,7 +118,44 @@ impl Snapshot {
             wallet: Wallet::from_parts([encryption], [])?,
         })
     }
+    fn committed(mut self, repo: &gix::Repository) -> Self {
+        for blobs in self.attachments.values_mut() {
+            for blob in blobs.values_mut() {
+                *blob = AttachmentBlob::from_git(repo, blob.oid(), blob.len());
+            }
+        }
+        self
+    }
     pub fn validate(&self) -> Result<()> {
+        for (owner, blobs) in &self.attachments {
+            if !self.wallet.entries().contains_key(owner)
+                || self.is_metadata(owner)
+                || blobs.is_empty()
+                || blobs.len() > kagitaba_cxf::attachments::MAX_ATTACHMENTS
+            {
+                return Err(Error::Invalid);
+            }
+            for (id, chunks) in blobs {
+                if id.parse::<EntryId>()?.to_string() != *id {
+                    return Err(Error::Invalid);
+                }
+                if chunks.len() < 88 || chunks.len() > kagitaba_cxf::attachments::MAX_BLOB_BYTES {
+                    return Err(Error::Invalid);
+                }
+            }
+        }
+        for (id, bytes) in &self.index_keys {
+            if !self.wallet.participants().contains_key(id)
+                || kagitaba_core::crypto::WrappedKey::from_bytes(bytes)?.recipient() != *id
+            {
+                return Err(Error::Invalid);
+            }
+        }
+        for (id, bytes) in &self.indexes {
+            if !self.index_keys.contains_key(id) || bytes.len() > index::MAX_INDEX_BYTES {
+                return Err(Error::Invalid);
+            }
+        }
         let mut seen = std::collections::BTreeSet::new();
         for (participant, entry) in &self.metadata {
             if !self.wallet.participants().contains_key(participant)
@@ -160,6 +213,7 @@ impl Store {
         let repo = worktree::initialize(path)?;
         let head = write_commit(&repo, None, &snapshot, signer, "Create wallet")?;
         publish(&repo, None, head, "Create wallet")?;
+        let snapshot = snapshot.committed(&repo);
         Ok(Self {
             repo,
             path: path.to_owned(),
@@ -198,7 +252,7 @@ impl Store {
         let new = write_commit(&self.repo, Some(self.head), &next, signer, message)?;
         publish(&self.repo, Some(self.head), new, message)?;
         self.head = new;
-        self.snapshot = next;
+        self.snapshot = next.committed(&self.repo);
         Ok(())
     }
     /// Candidate objects must already be present (e.g. fetched into a quarantine ref).
@@ -215,7 +269,7 @@ impl Store {
             "Accept verified updates",
         )?;
         self.head = candidate;
-        self.snapshot = next;
+        self.snapshot = next.committed(&self.repo);
         Ok(())
     }
     /// Pull a local replica only after verifying authorized history back
@@ -234,7 +288,12 @@ impl Store {
     }
     /// Build a clean merge and optionally a signed application-maintenance child.
     /// Both signatures and final verification precede the single ref/checkout update.
-    pub fn merge_then(&mut self, candidate: ObjectId, signer: &impl Signer, repair: impl FnOnce(&mut Snapshot) -> Result<bool>) -> Result<()> {
+    pub fn merge_then(
+        &mut self,
+        candidate: ObjectId,
+        signer: &impl Signer,
+        repair: impl FnOnce(&mut Snapshot) -> Result<bool>,
+    ) -> Result<()> {
         verify_history(&self.repo, self.head, &self.root_signer, Some(self.head))?;
         let incoming = verify_history(&self.repo, candidate, &self.root_signer, None)?;
         let graph = history(&self.repo, candidate)?;
@@ -274,16 +333,32 @@ impl Store {
         )?;
         self.publish_repaired(head, next, signer, repair)
     }
-    fn publish_repaired(&mut self, mut head: ObjectId, mut next: Snapshot, signer: &impl Signer, repair: impl FnOnce(&mut Snapshot) -> Result<bool>) -> Result<()> {
+    fn publish_repaired(
+        &mut self,
+        mut head: ObjectId,
+        mut next: Snapshot,
+        signer: &impl Signer,
+        repair: impl FnOnce(&mut Snapshot) -> Result<bool>,
+    ) -> Result<()> {
         let clean = next.clone();
         if repair(&mut next)? {
             next.validate()?;
             validate_transition(&clean, &next)?;
-            if !clean.signers.values().any(|key| key == signer.public_key()) { return Err(Error::Signature); }
-            head = write_commit(&self.repo, Some(head), &next, signer, "Complete participant metadata grants")?;
+            if !clean.signers.values().any(|key| key == signer.public_key()) {
+                return Err(Error::Signature);
+            }
+            head = write_commit(
+                &self.repo,
+                Some(head),
+                &next,
+                signer,
+                "Complete participant metadata grants",
+            )?;
         }
         verify_history(&self.repo, head, &self.root_signer, Some(self.head))?;
-        if head == self.head { return Ok(()); }
+        if head == self.head {
+            return Ok(());
+        }
         publish(
             &self.repo,
             Some(self.head),
@@ -291,7 +366,7 @@ impl Store {
             "Merge verified histories",
         )?;
         self.head = head;
-        self.snapshot = next;
+        self.snapshot = next.committed(&self.repo);
         Ok(())
     }
     /// Merge a local replica after authenticating its complete history.
@@ -420,10 +495,16 @@ fn copy_objects(source: &gix::Repository, target: &gix::Repository, head: Object
             return Err(Error::Invalid);
         }
         let header = source.find_header(id).map_err(|_| Error::Invalid)?;
-        if header.size() > 16 * 1024 * 1024 || header.size() > remaining {
+        if header.size() > kagitaba_cxf::attachments::MAX_BLOB_BYTES as u64
+            || header.size() > remaining
+        {
             return Err(Error::Invalid);
         }
         remaining -= header.size();
+        if header.kind() == gix::objs::Kind::Blob {
+            AttachmentBlob::from_git(source, id, header.size() as usize).write_into(target)?;
+            continue;
+        }
         let obj = source.find_object(id).map_err(|_| Error::Invalid)?;
         if gix::objs::compute_hash(gix::hash::Kind::Sha1, obj.kind, &obj.data)
             .map_err(|_| Error::Invalid)?
@@ -500,6 +581,34 @@ fn validate_transition(old: &Snapshot, new: &Snapshot) -> Result<()> {
         {
             return Err(Error::Invalid);
         }
+        if let Some(previous) = old.wallet.entries().get(id)
+            && old.attachments.get(id) != new.attachments.get(id)
+            && previous.primary().revision_id() == entry.primary().revision_id()
+        {
+            return Err(Error::Invalid);
+        }
+        if let Some(previous_blobs) = old.attachments.get(id)
+            && new.attachments.get(id).is_some_and(|next| {
+                previous_blobs
+                    .iter()
+                    .any(|(blob, bytes)| next.get(blob).is_some_and(|current| current != bytes))
+            })
+        {
+            return Err(Error::Invalid);
+        }
+        if let Some(previous) = old.wallet.entries().get(id)
+            && previous
+                .grants()
+                .keys()
+                .any(|key| !entry.grants().contains_key(key))
+            && old.attachments.get(id).is_some_and(|blobs| {
+                new.attachments
+                    .get(id)
+                    .is_some_and(|next| blobs.keys().any(|blob| next.contains_key(blob)))
+            })
+        {
+            return Err(Error::Invalid);
+        }
     }
     Ok(())
 }
@@ -566,7 +675,46 @@ fn write_commit_tree(
         .map(|id| id.detach())
         .map_err(|_| Error::Io)
 }
-type Files = BTreeMap<String, Vec<u8>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FileData {
+    Bytes(Vec<u8>),
+    Attachment(AttachmentBlob),
+}
+impl FileData {
+    fn len(&self) -> usize {
+        match self {
+            Self::Bytes(v) => v.len(),
+            Self::Attachment(b) => b.len(),
+        }
+    }
+    fn into_bytes(self) -> Result<Vec<u8>> {
+        match self {
+            Self::Bytes(v) => Ok(v),
+            _ => Err(Error::Invalid),
+        }
+    }
+    fn oid(&self) -> Result<ObjectId> {
+        match self {
+            Self::Bytes(v) => {
+                gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, v)
+                    .map_err(|_| Error::Invalid)
+            }
+            Self::Attachment(b) => Ok(b.oid()),
+        }
+    }
+    fn open(&self) -> Result<Box<dyn std::io::Read + '_>> {
+        match self {
+            Self::Bytes(v) => Ok(Box::new(std::io::Cursor::new(v.as_slice()))),
+            Self::Attachment(b) => b.open(),
+        }
+    }
+}
+impl From<Vec<u8>> for FileData {
+    fn from(v: Vec<u8>) -> Self {
+        Self::Bytes(v)
+    }
+}
+type Files = BTreeMap<String, FileData>;
 fn files(snapshot: &Snapshot) -> Result<Files> {
     snapshot.validate()?;
     let mut files = BTreeMap::from([("kagitaba-format".into(), b"1\n".to_vec())]);
@@ -583,7 +731,10 @@ fn files(snapshot: &Snapshot) -> Result<Files> {
             files.insert(format!("participants/{id}/device.json"), hint.to_json()?);
         }
         if let Some(entry) = snapshot.metadata.get(id) {
-            files.insert(format!("participants/{id}/meta.entry"), format!("{entry}\n").into_bytes());
+            files.insert(
+                format!("participants/{id}/meta.entry"),
+                format!("{entry}\n").into_bytes(),
+            );
         }
         if let Some(name) = snapshot.names.get(id) {
             files.insert(
@@ -598,13 +749,31 @@ fn files(snapshot: &Snapshot) -> Result<Files> {
             );
         }
     }
+    for (id, bytes) in &snapshot.index_keys {
+        files.insert(format!("participants/{id}/index-key"), bytes.clone());
+    }
+    for (id, bytes) in &snapshot.indexes {
+        files.insert(format!("cache/{id}/index"), bytes.clone());
+    }
     for (id, entry) in snapshot.wallet.entries() {
         files.insert(format!("entries/{id}/primary"), entry.primary().to_bytes());
         for (key, grant) in entry.grants() {
             files.insert(format!("entries/{id}/grants/{key}"), grant.to_bytes());
         }
     }
-    if files.len() > MAX_FILES || files.values().map(Vec::len).sum::<usize>() > MAX_SNAPSHOT {
+    let mut files: Files = files
+        .into_iter()
+        .map(|(p, b)| (p, FileData::Bytes(b)))
+        .collect();
+    for (id, blobs) in &snapshot.attachments {
+        for (blob, value) in blobs {
+            files.insert(
+                format!("entries/{id}/attachments/{blob}"),
+                FileData::Attachment(value.clone()),
+            );
+        }
+    }
+    if files.len() > MAX_FILES || files.values().map(FileData::len).sum::<usize>() > MAX_SNAPSHOT {
         return Err(Error::Invalid);
     }
     Ok(files)
@@ -621,7 +790,12 @@ fn write_tree(repo: &gix::Repository, files: &Files) -> Result<ObjectId> {
             entries.push(TreeEntry {
                 mode: EntryKind::Blob.into(),
                 filename: path.as_str().into(),
-                oid: repo.write_blob(value).map_err(|_| Error::Io)?.detach(),
+                oid: match value {
+                    FileData::Bytes(bytes) => {
+                        repo.write_blob(bytes).map_err(|_| Error::Io)?.detach()
+                    }
+                    FileData::Attachment(blob) => blob.write_into(repo)?,
+                },
             });
         }
     }
@@ -677,28 +851,45 @@ fn read_tree(
                 depth + 1,
             )?,
             EntryKind::Blob => {
-                let size = repo
+                let parts: Vec<_> = path.split('/').collect();
+                let limit = match parts.as_slice() {
+                    ["entries", _, "attachments", _] => kagitaba_cxf::attachments::MAX_BLOB_BYTES,
+                    _ => 2 * 1024 * 1024 + 100,
+                };
+                let header = repo
                     .find_header(e.oid.to_owned())
-                    .map_err(|_| Error::Invalid)?
-                    .size();
-                if size > 2 * 1024 * 1024 + 100 || size > *budget as u64 {
-                    return Err(Error::Invalid);
-                }
-                let blob = repo
-                    .find_blob(e.oid.to_owned())
                     .map_err(|_| Error::Invalid)?;
-                if blob.data.len() > 2 * 1024 * 1024 + 100 || blob.data.len() > *budget {
+                if header.kind() != gix::objs::Kind::Blob {
                     return Err(Error::Invalid);
                 }
-                *budget -= blob.data.len();
-                if gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &blob.data)
-                    .map_err(|_| Error::Invalid)?
-                    .as_ref()
-                    != e.oid
-                {
+                let size = header.size();
+                if size > limit as u64 || size > *budget as u64 {
                     return Err(Error::Invalid);
                 }
-                if files.insert(path, blob.data.to_vec()).is_some() {
+                *budget -= size as usize;
+                let value = if matches!(parts.as_slice(), ["entries", _, "attachments", _]) {
+                    FileData::Attachment(AttachmentBlob::from_git(
+                        repo,
+                        e.oid.to_owned(),
+                        size as usize,
+                    ))
+                } else {
+                    let blob = repo.find_object(e.oid).map_err(|_| Error::Invalid)?;
+                    if blob.kind != gix::objs::Kind::Blob
+                        || blob.data.len() != size as usize
+                        || gix::objs::compute_hash(
+                            gix::hash::Kind::Sha1,
+                            gix::objs::Kind::Blob,
+                            &blob.data,
+                        )
+                        .map_err(|_| Error::Invalid)?
+                            != e.oid
+                    {
+                        return Err(Error::Invalid);
+                    }
+                    FileData::Bytes(blob.data.to_vec())
+                };
+                if files.insert(path, value).is_some() {
                     return Err(Error::Invalid);
                 }
             }
@@ -717,9 +908,20 @@ fn read_files(repo: &gix::Repository, tree: ObjectId) -> Result<Files> {
     Ok(files)
 }
 fn snapshot_from_files(mut files: Files) -> Result<Snapshot> {
-    if files.remove("kagitaba-format").as_deref() != Some(b"1\n") {
+    if files.len() > MAX_FILES || files.values().map(FileData::len).sum::<usize>() > MAX_SNAPSHOT {
         return Err(Error::Invalid);
     }
+    if files
+        .remove("kagitaba-format")
+        .ok_or(Error::Invalid)?
+        .into_bytes()?
+        != b"1\n"
+    {
+        return Err(Error::Invalid);
+    }
+    let mut index_keys = BTreeMap::new();
+    let mut attachments: BTreeMap<EntryId, BTreeMap<String, AttachmentBlob>> = BTreeMap::new();
+    let mut indexes = BTreeMap::new();
     let mut keys = BTreeMap::new();
     let mut signers = BTreeMap::new();
     let mut devices = BTreeMap::new();
@@ -730,7 +932,28 @@ fn snapshot_from_files(mut files: Files) -> Result<Snapshot> {
     let mut grants: BTreeMap<EntryId, Vec<GrantRecord>> = BTreeMap::new();
     for (path, data) in files {
         let parts: Vec<_> = path.split('/').collect();
+        if let ["entries", owner, "attachments", blob] = parts.as_slice() {
+            let owner: EntryId = owner.parse()?;
+            if blob.parse::<EntryId>()?.to_string() != *blob {
+                return Err(Error::Invalid);
+            }
+            let FileData::Attachment(value) = data else {
+                return Err(Error::Invalid);
+            };
+            attachments
+                .entry(owner)
+                .or_default()
+                .insert((*blob).to_owned(), value);
+            continue;
+        }
+        let data = data.into_bytes()?;
         match parts.as_slice() {
+            ["participants", id, "index-key"] => {
+                index_keys.insert(id.parse()?, data);
+            }
+            ["cache", id, "index"] => {
+                indexes.insert(id.parse()?, data);
+            }
             ["participants", id, "meta.entry"] => {
                 let text = std::str::from_utf8(&data).map_err(|_| Error::Invalid)?;
                 let entry = text.strip_suffix('\n').ok_or(Error::Invalid)?.parse()?;
@@ -795,6 +1018,9 @@ fn snapshot_from_files(mut files: Files) -> Result<Snapshot> {
         return Err(Error::Invalid);
     }
     let snapshot = Snapshot {
+        attachments,
+        index_keys,
+        indexes,
         metadata,
         names,
         browsers,

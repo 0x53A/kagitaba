@@ -17,8 +17,8 @@ class ProviderActivity : SecureActivity() {
         ticket = RequestTickets.take(intent)
         screen("Use your wallet")
         label((application as KagitabaApp).wallets.name(vault.walletId))
-        if (ticket == null) { label("This request expired. Return to the requesting app and try again."); button("Close") { finish() }; return }
-        label("Unlock to review this request.")
+        if (ticket == null) { label("This request expired. Return to the requesting app and try again.", 14); button("Close") { finish() }; return }
+        label("Unlock to review this request.", 14)
         button("Unlock and continue", primary = true) { authenticate { approvedEpoch = vault.epoch; process() } }
         button("Cancel") { finish() }
     }
@@ -73,7 +73,7 @@ class ProviderActivity : SecureActivity() {
             }
         } else {
             val provider = PendingIntentHandler.retrieveProviderGetCredentialRequest(intent) ?: error("Missing sign-in request")
-            val item = vault.entries().firstOrNull { it.id == ticket.entryId } ?: error("Entry is no longer available")
+            val item = vault.entry(ticket.entryId ?: error("Missing entry"))
             val option = provider.credentialOptions.singleOrNull() ?: error("Ambiguous request")
             when (option) {
                 is GetPublicKeyCredentialOption -> {
@@ -83,7 +83,7 @@ class ProviderActivity : SecureActivity() {
                     val match = Passkeys(policy).matches(listOf(item), opts).firstOrNull { it.credential.getString("credentialId") == ticket.credentialId } ?: error("Passkey does not match")
                     withContext(Dispatchers.IO) { policy.authorizeRp(provider.callingAppInfo, opts.getString("rpId")) }
                     screen("Sign in with passkey"); label(opts.getString("rpId"), 22); label(match.credential.optString("username", item.title))
-                    if (writesBlob) label("This app also wants to save data with this passkey. Saving may require another security-key touch.")
+                    if (writesBlob) label("This app also wants to save data with this passkey. Saving may require another security-key touch.", 14)
                     button("Sign in", primary = true) { work("Signing in…") {
                         authorized()
                         val response = withContext(Dispatchers.IO) { Passkeys(policy).assert(opts, provider.callingAppInfo, option.clientDataHash, match, vault) }

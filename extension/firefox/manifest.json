@@ -1,15 +1,58 @@
 {
   "manifest_version": 2,
   "name": "Kagitaba",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "An encrypted participant wallet, password manager and software passkey provider.",
-  "browser_specific_settings": {"gecko": {"id": "firefox@kagitaba.local", "strict_min_version": "150.0", "data_collection_permissions": {"required": ["none"]}}},
-  "permissions": ["storage", "unlimitedStorage", "tabs", "webNavigation", "alarms", "https://*/*"],
-  "background": {"scripts": ["background.js"], "persistent": true},
-  "browser_action": {"default_title": "Open Kagitaba"},
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "firefox@kagitaba.local",
+      "strict_min_version": "150.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  },
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "unlimitedStorage",
+    "tabs",
+    "webNavigation",
+    "alarms",
+    "https://*/*"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ],
+    "persistent": true
+  },
+  "browser_action": {
+    "default_title": "Open Kagitaba"
+  },
   "content_security_policy": "script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'none'",
   "content_scripts": [
-    {"matches": ["https://*/*"], "js": ["bridge.js"], "run_at": "document_start", "world": "MAIN"},
-    {"matches": ["https://*/*"], "js": ["content.js"], "run_at": "document_start", "all_frames": false}
+    {
+      "matches": [
+        "https://*/*"
+      ],
+      "js": [
+        "bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
   ]
 }

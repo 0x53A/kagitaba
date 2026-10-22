@@ -19,7 +19,8 @@ impl App {
         app.screen = Screen::Wallet;
         let participant = KeyId::from_bytes([7; 32]);
         app.participants = vec![participant];
-        app.participant_names.insert(participant, "Everyday YubiKey".into());
+        app.participant_names
+            .insert(participant, "Everyday YubiKey".into());
         app.unlocked = Some(participant.to_string());
         let id = EntryId::from_bytes([1; 16]);
         app.selected = Some(id);
@@ -42,7 +43,10 @@ impl App {
         app.remote_configured = Some(true);
         app.remote_status = Some(crate::remote::Status {
             head: "fedcba9876543210fedcba9876543210fedcba98".into(),
-            relation: kagitaba_store::HistoryRelation { ahead: 1, behind: 2 },
+            relation: kagitaba_store::HistoryRelation {
+                ahead: 1,
+                behind: 2,
+            },
         });
         app.remote_checked = Some(Instant::now());
         for (id, title) in
@@ -53,23 +57,217 @@ impl App {
             app.titles.insert(*id, Zeroizing::new(title.to_owned()));
         }
         match scene {
+            "urls" => {
+                let mut value: serde_json::Value = serde_json::from_str(&app.json).unwrap();
+                value["entity"]["scope"]["urls"] = serde_json::json!([
+                    "https://primary.example.test", "https://accounts.example.test/login", "https://portal.example.test/a/long/path?with=parameters", "https://mail.example.test"
+                ]);
+                app.json = serde_json::to_string(&value).unwrap();
+                app.entry_original = Zeroizing::new(app.json.clone());
+            }
+            "collections" | "collection-selected" | "collection-unfiled" => {
+                app.selected = None;
+                app.json.clear();
+                app.entry_original.clear();
+                for (index, entry) in app.entries.iter().enumerate() {
+                    app.index_rows.insert(*entry, kagitaba_store::index::Row {
+                        digest:[1;32],grant_digest:[2;32],title:app.titles[entry].to_string(),
+                        kind:kagitaba_cxf::PayloadKind::Item,collection:None,
+                        usernames:vec![format!("account{}@example.test",index+1)],scopes:vec![],password:true,totp:false,passkey:false,
+                    });
+                }
+                let owner = EntryId::from_bytes([4;16]);
+                app.entries.push(owner);
+                app.titles.insert(owner,Zeroizing::new("Personal".into()));
+                app.index_rows.insert(owner,kagitaba_store::index::Row {
+                    digest:[3;32],grant_digest:[4;32],title:"Personal".into(),kind:kagitaba_cxf::PayloadKind::Collection,
+                    collection:Some(kagitaba_store::index::CollectionNode {
+                        id:owner.as_bytes().to_vec(),title:"Personal".into(),entries:vec![id],unresolved_links:1,children:vec![kagitaba_store::index::CollectionNode {
+                            id:vec![8],title:"Home".into(),entries:vec![EntryId::from_bytes([2;16])],children:vec![],unresolved_links:0,
+                        }],
+                    }),usernames:vec![],scopes:vec![],password:false,totp:false,passkey:false,
+                });
+                if scene == "collection-selected" { app.select_collection(Some((owner,vec![])),false); }
+                if scene == "collection-unfiled" { app.select_collection(None,true); }
+            }
+            "passkey" => {
+                use p256::pkcs8::EncodePrivateKey;
+                let key = p256::SecretKey::from_slice(&[7; 32]).unwrap().to_pkcs8_der().unwrap();
+                let mut value: serde_json::Value = serde_json::from_str(&app.json).unwrap();
+                value["entity"]["credentials"] = serde_json::json!([{
+                    "type":"passkey", "rpId":"example.test", "username":"alex@example.test",
+                    "userDisplayName":"Alex Example", "credentialId":"c3ludGhldGljLWNyZWRlbnRpYWw",
+                    "userHandle":"c3ludGhldGljLWhhbmRsZQ", "key":data_encoding::BASE64URL_NOPAD.encode(key.as_bytes()),
+                    "kagitabaBackupFlags":{"eligible":true,"state":false}
+                }]);
+                app.json = serde_json::to_string(&value).unwrap();
+                app.entry_original = Zeroizing::new(app.json.clone());
+            }
+            "custom-fields" => {
+                let mut value: serde_json::Value = serde_json::from_str(&app.json).unwrap();
+                value["entity"]["credentials"] = serde_json::json!([{"type":"custom-fields","fields":[
+                    {"label":"Pin","fieldType":"string","value":"synthetic-hidden-pin"},
+                    {"label":"Reference","fieldType":"string","value":"EXAMPLE-42"},
+                    {"label":"Enabled","fieldType":"boolean","value":"true"}
+                ]}]);
+                app.json = serde_json::to_string(&value).unwrap();
+                app.entry_original = Zeroizing::new(app.json.clone());
+            }
+            "attachments" => {
+                let payload = kagitaba_cxf::Payload::new(id, kagitaba_cxf::PayloadKind::Item, &serde_json::to_vec(&serde_json::json!({
+                    "id":data_encoding::BASE64URL_NOPAD.encode(id.as_bytes()), "title":"Project documents", "credentials":[]
+                })).unwrap()).unwrap();
+                let (payload, _) = kagitaba_cxf::attachments::add(
+                    &payload,
+                    "Example.txt",
+                    b"Synthetic attachment fixture",
+                    &mut rand::rngs::SysRng,
+                )
+                .unwrap();
+                app.json = String::from_utf8(payload.to_json().unwrap().to_vec()).unwrap();
+                app.entry_original = Zeroizing::new(app.json.clone());
+                app.entry_digest = Some([1; 32]);
+            }
+            "index-preview" => {
+                app.json.zeroize();
+                app.entry_original.zeroize();
+                app.index_rows.insert(
+                    id,
+                    kagitaba_store::index::Row {
+                        digest: [1; 32],
+                        grant_digest: [2; 32],
+                        title: "Example account".into(),
+                        kind: kagitaba_cxf::PayloadKind::Item,
+                        collection: None,
+                        usernames: vec!["alex@example.test".into()],
+                        scopes: vec![
+                            "https://example.test".into(),
+                            "example.test".into(),
+                            "android:{\"bundleId\":\"test.example\"}".into(),
+                        ],
+                        password: true,
+                        totp: true,
+                        passkey: false,
+                    },
+                );
+            }
             "import" => app.screen = Screen::Import,
             "review" => {
                 app.screen = Screen::Import;
-                app.preview = Some("3 entries · 1 collection\nNo unresolved references or unsupported credentials.".into());
+                app.preview = Some(crate::backend::ImportPreview {
+                    entries: Vec::new(),
+                    imported_files: 0,
+                    existing_duplicates: 0,
+                    duplicate_differences: Default::default(),
+                    unavailable_entries: 0,
+                    report: kagitaba_cxf::ImportReport {
+                        items: 3, root_collections: 1, accounts: 1,
+                        opaque_credentials: 3,
+                        opaque_credential_types: BTreeMap::from([("credit-card".into(), 2), ("ssh-key".into(), 1)]),
+                        ..Default::default()
+                    },
+                    warnings: crate::backend::ImportWarnings {
+                        omitted: BTreeMap::from([("Items with attachment bytes not imported", 1)]),
+                        ..Default::default()
+                    },
+                });
+            }
+            "import-item" | "import-item-details" | "import-item-history" | "import-warnings" => {
+                app.screen = Screen::Import;
+                let source = serde_json::json!({"encrypted":false,"folders":[],"items":[{
+                    "id":"synthetic-account","type":1,"name":"Example account","notes":"Synthetic account note",
+                    "login":{"username":"alex@example.test","password":"synthetic-current-password","uris":[{"uri":"https://example.test","match":null}]},
+                    "fields":[{"name":"Support reference","type":0,"value":"EXAMPLE-42"},{"name":"Recovery phrase","type":1,"value":"synthetic-recovery-value"}],
+                    "passwordHistory":[{"password":"synthetic-previous-password","lastUsedDate":"2025-01-01T00:00:00Z"}],
+                    "futureField":{"example":"preserved vendor data"}
+                }]});
+                let conversion = kagitaba_cxf::bitwarden::from_json(&serde_json::to_vec(&source).unwrap()).unwrap();
+                let plan = conversion.document().plan_import(&kagitaba_core::wallet::Wallet::default(), &mut rand::rngs::SysRng).unwrap();
+                let mut preview = crate::backend::ImportPreview::from_plan(&plan, Default::default()).unwrap();
+                let (payload, _) = kagitaba_cxf::attachments::add(&plan.entries()[0], "Example.txt", b"Synthetic imported file", &mut rand::rngs::SysRng).unwrap();
+                preview.entries[0] = crate::backend::import_preview::PreviewEntry::from_payload(&payload).unwrap();
+                preview.imported_files = 1;
+                if scene != "import-item" {
+                    for entry in &mut preview.entries {
+                        entry.expanded = true;
+                        entry.reveal_history = scene == "import-item-history";
+                    }
+                }
+                if scene == "import-warnings" {
+                    preview.existing_duplicates = 1;
+                    preview.unavailable_entries = 2;
+                    preview.warnings.retained.insert("Unsupported passkeys: source data only", 1);
+                    preview.warnings.details.push(crate::backend::ImportDiagnostic {
+                        source_id: Zeroizing::new(String::new()), entry_index: Some(0),
+                        detail: kagitaba_cxf::WarningDetail {
+                            reason: "The original passkey backup flag is missing.",
+                            field: Some("KPEX_PASSKEY_FLAG_BE"),
+                            action: "Confirm the original registration flag in the source app. Do not guess its value.",
+                        },
+                    });
+                    preview.entries[0].expanded = false;
+                }
+                app.preview = Some(preview);
+                app.import_recipients = vec![participant];
+            }
+            "generator" => app.tools.open_generator(None),
+            "totp" => app.tools.totp = true,
+            "access" => {
+                app.screen = Screen::Access;
+                app.access_target = Some(participant);
+                app.access_preview = Some(crate::backend::access::AccessPreview { target: participant, already_granted: 3, new_grants: 12, unavailable: 1 });
+            }
+            "duplicates" => {
+                app.screen = Screen::Duplicates;
+                app.duplicate_preview = Some(crate::backend::duplicates::DuplicatePreview {
+                    groups: vec![crate::backend::duplicates::DuplicateGroup {
+                        survivor: id, removed: vec![EntryId::from_bytes([2;16])], title: Zeroizing::new("Example account".into()), recipient_count: 2,
+                    }], unavailable_entries: 1,
+                });
+            }
+            "copy" | "copy-review" | "copy-unlock" => {
+                app.screen = Screen::Copy;
+                app.copy_selection.insert(id);
+                app.index_rows.insert(id, kagitaba_store::index::Row {
+                    digest: [1;32], grant_digest: [2;32], title: "Example account".into(), kind: kagitaba_cxf::PayloadKind::Item, collection: None,
+                    usernames: vec!["alex@example.test".into()], scopes: vec![], password: true, totp: false, passkey: false,
+                });
+                if scene != "copy" {
+                    app.copy_active = true;
+                    app.copy_recipients = vec![participant];
+                    app.copy_preview = Some(crate::backend::CopyPreview {
+                        path: "/home/example/Wallets/Family".into(), participants: vec![participant],
+                        review: crate::backend::ImportPreview { existing_duplicates: 1, ..Default::default() },
+                        requires_unlock: scene == "copy-unlock", default_recipient: Some(participant),
+                    });
+                }
             }
             "keys" => app.screen = Screen::Keys,
             "transfer" => app.screen = Screen::Transfer,
             "unlock" => {
                 app.clear_secrets();
                 app.screen = Screen::Unlock;
+                app.pin = "123456".into();
             }
-            "create" | "provision" => {
+            "create" | "provision" | "create-ready-new" | "create-created" | "enrollment" => {
                 app.clear_secrets();
+                app.provision = scene == "provision";
                 app.wallet = None;
                 app.create_path = Some("/home/example/Wallets/New wallet".into());
-                app.screen = Screen::Create;
-                app.provision = scene == "provision";
+                app.screen = if scene == "enrollment" {
+                    Screen::Enrollment
+                } else {
+                    Screen::Create
+                };
+                if matches!(scene, "create-ready-new" | "create-created") {
+                    app.inspected_slots = Some(vec![]);
+                    app.provision = true;
+                    app.management = "synthetic".into();
+                    app.consent = scene == "create-ready-new";
+                }
+                if scene == "create-created" {
+                    app.unlocked = Some(participant.to_string());
+                }
             }
             "touch" => {
                 app.busy = true;
@@ -91,12 +289,16 @@ impl App {
     }
 
     pub(super) fn dirty(&self) -> bool {
-        self.name_edit.is_some() || self.selected.is_some()
-            && (!self.json.is_empty() && self.json != *self.entry_original
-                || self.recipients != self.original_recipients)
+        self.name_edit.is_some()
+            || self.selected.is_some()
+                && (!self.json.is_empty() && self.json != *self.entry_original
+                    || self.recipients != self.original_recipients)
     }
 
     pub(super) fn navigate(&mut self, action: Leave) {
+        if matches!(action, Leave::Select(id) if self.selected == Some(id)) {
+            return;
+        }
         if self.dirty() {
             self.leave_action = Some(action);
         } else {
@@ -104,26 +306,49 @@ impl App {
         }
     }
 
-    fn leave(&mut self, action: Leave) {
+    pub(super) fn leave(&mut self, action: Leave) {
+        if matches!(action, Leave::RevertEntry) {
+            self.tools = Default::default();
+            self.leave_action = None;
+            if self.selected.is_some_and(|id| self.entries.contains(&id)) {
+                self.json.zeroize();
+                self.json = self.entry_original.to_string();
+                self.recipients = self.original_recipients.clone();
+                self.reveal = false;
+                self.delete_confirm = false;
+                self.editor_epoch = self.editor_epoch.wrapping_add(1);
+                self.ctx.memory_mut(|m| m.data.clear());
+            } else {
+                self.reset_entry();
+            }
+            return;
+        }
+        if self.screen == Screen::Access { self.send(Command::DiscardAccess); }
+        self.access_preview = None;
+        self.access_target = None;
         self.name_edit = None;
         self.reset_entry();
         self.leave_action = None;
         match action {
             Leave::Select(id) => {
                 self.select_entry(id);
-                if self.unlocked.is_some() {
-                    self.send(Command::Read(id));
-                }
             }
             Leave::New(collection) => self.new_entry(collection),
             Leave::Screen(screen) => {
                 if self.screen == Screen::Import {
                     self.send(Command::DiscardImport);
                 }
+                if self.screen == Screen::Copy { self.send(Command::DiscardCopy); }
+                self.copy_preview = None;
+                self.copy_complete = false;
+                self.copy_active = false;
+                self.copy_recipients.clear();
+                if self.screen == Screen::Duplicates { self.send(Command::DiscardDuplicates); }
+                self.duplicate_preview = None;
                 self.screen = screen;
                 self.consent = false;
                 self.revoke_confirm = false;
-                self.provision = false;
+                self.provision = true;
                 self.preview = None;
                 self.import_complete = false;
                 self.import_password.zeroize();
@@ -137,63 +362,111 @@ impl App {
                 self.locking = true;
                 self.send(Command::Close);
             }
-            Leave::DismissEntry => {}
+            Leave::DismissEntry | Leave::RevertEntry => {}
         }
     }
 
     pub(super) fn shell(&mut self, ui: &mut egui::Ui) {
         let narrow = ui.available_width() < 780.0;
+        if narrow {
+            ui.label(egui::RichText::new("K A G I T A B A").color(theme::AQUA).monospace().size(18.0));
+        }
         ui.horizontal_wrapped(|ui| {
-            ui.heading(
+            if !narrow { ui.heading(
                 egui::RichText::new("K A G I T A B A")
                     .color(theme::AQUA)
                     .monospace()
                     .size(18.0),
-            );
-            if self.screen != Screen::Home {
-                if !narrow && let Some(path) = &self.wallet {
+            ); }
+            if !narrow && let Some(path) = &self.wallet {
+                ui.add_sized(
+                    [180.0, 36.0],
+                    egui::Label::new(egui::RichText::new(wallet_name(path)).size(19.0).strong()).truncate(),
+                )
+                .on_hover_text(path.display().to_string());
+            }
+            if !narrow {
+                self.remote_ui(ui);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.screen != Screen::Home
+                    && ui
+                        .add_enabled(
+                            !self.busy,
+                            egui::Button::new(egui::RichText::new("×").color(theme::ERROR)),
+                        )
+                        .on_hover_text("Close wallet")
+                        .clicked()
+                {
+                    self.navigate(Leave::Close);
+                }
+                if let Some(path) = self.wallet.clone() {
+                    let favorite = self.preferences.favorites.contains(&path);
+                    if ui
+                        .button(
+                            egui::RichText::new(if favorite { "★" } else { "☆" })
+                                .color(theme::AQUA),
+                        )
+                        .on_hover_text(if favorite {
+                            "Remove from favorites"
+                        } else {
+                            "Add to favorites"
+                        })
+                        .clicked()
+                    {
+                        self.preferences.toggle_favorite(&path);
+                        self.save_preferences();
+                    }
+                }
+                ui.menu_button("Tools", |ui| {
+                    if ui.add_enabled(self.unlocked.is_some(), egui::Button::new("Manage access…")).clicked() {
+                        self.navigate(Leave::Screen(Screen::Access));
+                        ui.close();
+                    }
+                    if ui.add_enabled(self.unlocked.is_some(), egui::Button::new("Copy to wallet…")).clicked() {
+                        self.copy_selection = self.selected.into_iter().collect();
+                        self.navigate(Leave::Screen(Screen::Copy));
+                        ui.close();
+                    }
+                    if ui.add_enabled(self.unlocked.is_some(), egui::Button::new("Delete duplicates…")).clicked() {
+                        self.navigate(Leave::Screen(Screen::Duplicates));
+                        ui.close();
+                    }
+                    if ui.button("Password generator").clicked() {
+                        self.tools.open_generator(None);
+                        ui.close();
+                    }
+                });
+                if (self.unlocked.is_some() || self.copy_active)
+                    && ui
+                        .add_enabled(!self.locking, egui::Button::new("Lock"))
+                        .clicked()
+                {
+                    self.request_lock();
+                }
+                if !matches!(self.screen, Screen::Home | Screen::Wallet | Screen::Unlock)
+                    && self.wallet.is_some()
+                    && ui
+                        .add_enabled(!self.busy, egui::Button::new("Back"))
+                        .clicked()
+                {
+                    self.navigate(Leave::Screen(Screen::Wallet));
+                }
+            });
+        });
+        if narrow && self.wallet.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(path) = &self.wallet {
                     ui.add_sized(
-                        [180.0, 24.0],
-                        egui::Label::new(wallet_name(path)).truncate(),
+                        [120.0, 36.0],
+                        egui::Label::new(egui::RichText::new(wallet_name(path)).size(19.0).strong()).truncate(),
                     )
                     .on_hover_text(path.display().to_string());
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.unlocked.is_some()
-                        && ui
-                            .add_enabled(!self.locking, egui::Button::new("Lock"))
-                            .clicked()
-                    {
-                        self.request_lock();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.busy,
-                            egui::Button::new(if self.screen == Screen::Wallet {
-                                "Close wallet"
-                            } else {
-                                "Back"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        if matches!(self.screen, Screen::Home | Screen::Create | Screen::Wallet)
-                            || self.wallet.is_none()
-                        {
-                            self.navigate(Leave::Close);
-                        } else {
-                            self.navigate(Leave::Screen(Screen::Wallet));
-                        }
-                    }
-                });
-            }
-        });
-        if narrow && let Some(path) = &self.wallet {
-            ui.add(egui::Label::new(wallet_name(path)).truncate())
-                .on_hover_text(path.display().to_string());
+                self.remote_ui(ui);
+            });
         }
         ui.separator();
-        self.remote_ui(ui);
         self.touch_progress_ui(ui);
         if self.busy || !self.status.is_empty() {
             ui.horizontal_wrapped(|ui| {
@@ -206,37 +479,51 @@ impl App {
         if let Some(error) = &self.preference_error {
             ui.colored_label(theme::ERROR, error);
         }
-        ui.add_enabled_ui(!self.busy && self.leave_action.is_none() && self.trust.is_none(), |ui| {
-            match self.screen {
+        ui.add_enabled_ui(
+            !self.busy && self.leave_action.is_none() && self.trust.is_none(),
+            |ui| match self.screen {
                 Screen::Home => self.home(ui),
                 Screen::Wallet => self.workspace(ui),
                 screen => {
-                    egui::ScrollArea::vertical().id_salt("workflow").show(ui, |ui| {
-                        ui.set_max_width(ui.available_width().min(720.0));
-                        theme::surface().show(ui, |ui| {
-                            match screen {
+                    let scroll = egui::ScrollArea::vertical()
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                        .id_salt("workflow");
+                    #[cfg(feature = "smoke")]
+                    let scroll = if std::env::var("KAGITABA_SMOKE_SCENE").as_deref() == Ok("import-item-history") {
+                        scroll.vertical_scroll_offset(850.0)
+                    } else { scroll };
+                    scroll.show(ui, |ui| {
+                            ui.set_max_width(ui.available_width().min(720.0));
+                            theme::surface().show(ui, |ui| match screen {
                                 Screen::Create => self.create(ui),
+                                Screen::Enrollment => self.enrollment(ui),
                                 Screen::Unlock => {
                                     ui.heading("Unlock your wallet");
                                     self.hardware_ui(ui);
-                                    if ui.button("Browse encrypted entries without unlocking").clicked() { self.screen = Screen::Wallet; }
                                 }
                                 Screen::Import => {
-                                    if self.unlocked.is_some() { self.import_ui(ui); }
-                                    else { self.unlock_prompt(ui); }
+                                    if self.unlocked.is_some() {
+                                        self.import_ui(ui);
+                                    } else {
+                                        self.unlock_prompt(ui);
+                                    }
                                 }
                                 Screen::Keys => self.keys_ui(ui),
                                 Screen::Transfer => self.transfer_ui(ui),
+                                Screen::Duplicates => self.duplicates_ui(ui),
+                                Screen::Access => self.access_ui(ui),
+                                Screen::Copy => self.copy_ui(ui),
                                 _ => {}
-                            }
+                            });
                         });
-                    });
                 }
-            }
-        });
+            },
+        );
         self.trust_modal(ui.ctx());
         if self.screen == Screen::Wallet
-            && ui.available_width() < 780.0
+            && !self.tools.generator
+            && !self.tools.totp
+            && ui.available_width() < 1100.0
             && self.selected.is_some()
             && self.leave_action.is_none()
         {
@@ -248,7 +535,7 @@ impl App {
                 .show(ui.ctx(), |ui| {
                     ui.set_max_width((ui.ctx().content_rect().width() - 80.0).min(420.0));
                     ui.heading("Discard unsaved changes?");
-                    ui.label("Your edits have not been saved to the wallet.");
+                    theme::caption(ui, "Your edits have not been saved to the wallet.");
                     if ui.button("Keep editing").clicked() {
                         self.leave_action = None;
                     }
@@ -281,7 +568,12 @@ impl App {
                             self.pick(Pick::Open);
                         }
                         if ui.button("Create wallet…").clicked() {
-                            self.pick(Pick::Create);
+                            self.screen = Screen::Create;
+                            self.send(Command::Scan);
+                        }
+                        if ui.button("Create enrollment bundle…").clicked() {
+                            self.screen = Screen::Enrollment;
+                            self.send(Command::Scan);
                         }
                     });
                     ui.add_space(12.0);
@@ -294,20 +586,24 @@ impl App {
                         self.save_preferences();
                     }
                     egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                         .id_salt("saved-wallets")
                         .show(ui, |ui| {
                             if !self.preferences.favorites.is_empty() {
                                 ui.add_space(12.0);
-                                ui.strong("Favorites");
+                                ui.heading(egui::RichText::new("Favorites").size(20.0));
                                 for path in self.preferences.favorites.clone() {
                                     self.wallet_row(ui, path, true);
                                 }
                             }
                             if self.preferences.remember {
                                 ui.add_space(12.0);
-                                ui.strong("Recent wallets");
+                                ui.heading(egui::RichText::new("Recent wallets").size(20.0));
                                 if self.preferences.recent.is_empty() {
-                                    ui.label("Wallets you open will appear here.");
+                                    ui.colored_label(
+                                        theme::MUTED,
+                                        "Wallets you open will appear here.",
+                                    );
                                 }
                                 for path in self.preferences.recent.clone() {
                                     self.wallet_row(ui, path, false);
@@ -321,78 +617,133 @@ impl App {
 
     fn wallet_row(&mut self, ui: &mut egui::Ui, path: PathBuf, favorite: bool) {
         ui.push_id(&path, |ui| {
-            egui::Frame::new()
-                .fill(theme::SURFACE)
-                .stroke(egui::Stroke::new(1.0, theme::LINE))
-                .inner_margin(8)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let width = (ui.available_width() - 100.0).max(60.0);
-                        if ui
-                            .add_sized(
-                                [width, 48.0],
-                                egui::Button::new(format!(
-                                    "{}\n{}",
-                                    wallet_name(&path),
-                                    path.display()
-                                ))
-                                .wrap(),
-                            )
-                            .clicked()
-                        {
-                            self.send(Command::Open(path.clone(), None));
-                        }
-                        if ui
-                            .button(if favorite { "★" } else { "☆" })
-                            .on_hover_text(if favorite {
-                                "Remove from favorites"
-                            } else {
-                                "Add to favorites"
-                            })
-                            .clicked()
-                        {
-                            self.preferences.toggle_favorite(&path);
-                            self.save_preferences();
-                        }
-                        if ui
-                            .button("×")
-                            .on_hover_text("Remove from this list. The wallet folder is kept.")
-                            .clicked()
-                        {
-                            self.preferences.remove(&path);
-                            self.save_preferences();
-                        }
-                    });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let width = (ui.available_width() - 88.0).max(60.0);
+                let mut label = egui::text::LayoutJob::default();
+                label.append(&wallet_name(&path), 0.0, egui::TextFormat {
+                    font_id: egui::FontId::proportional(16.0), color: theme::INK,
+                    ..Default::default()
                 });
+                label.append(&format!("\n{}", path.display()), 0.0, egui::TextFormat {
+                    font_id: egui::FontId::monospace(12.0), color: theme::MUTED,
+                    ..Default::default()
+                });
+                label.wrap.max_width = (width - 28.0).max(1.0);
+                label.wrap.max_rows = 2;
+                let label = ui.fonts_mut(|fonts| fonts.layout_job(label));
+                if ui
+                    .add_sized([width, 60.0], egui::Button::new("").left_text(label))
+                    .on_hover_text(path.display().to_string())
+                    .clicked()
+                {
+                    self.send(Command::Open(path.clone(), None));
+                }
+                if ui
+                    .add_sized(
+                        [44.0, 60.0],
+                        egui::Button::new(
+                            egui::RichText::new(if favorite { "★" } else { "☆" })
+                                .color(theme::AQUA),
+                        ),
+                    )
+                    .on_hover_text(if favorite {
+                        "Remove from favorites"
+                    } else {
+                        "Add to favorites"
+                    })
+                    .clicked()
+                {
+                    self.preferences.toggle_favorite(&path);
+                    self.save_preferences();
+                }
+                if ui
+                    .add_sized(
+                        [44.0, 60.0],
+                        egui::Button::new(egui::RichText::new("×").color(theme::ERROR)),
+                    )
+                    .on_hover_text("Remove saved location; keep wallet files")
+                    .clicked()
+                {
+                    self.preferences.remove(&path);
+                    self.save_preferences();
+                }
+            });
         });
     }
 
     fn create(&mut self, ui: &mut egui::Ui) {
         ui.heading("Create wallet");
-        ui.label("1 · Location     2 · Key     3 · Create");
-        if let Some(path) = &self.create_path {
-            ui.label(format!("Wallet folder: {}", path.display()));
-        }
-        if self.unlocked.is_none() {
-            ui.label("Unlock an existing Kagitaba key, or set up two unused PIV slots.");
-            self.hardware_ui(ui);
-        } else {
-            ui.colored_label(theme::AQUA, "Your key is ready");
-            ui.label("Touch your key to sign the new wallet.");
+        theme::caption(ui, "Location");
+        let mut location = self
+            .create_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let width = (ui.available_width() - 48.0).max(100.0);
+            if ui
+                .add_sized([width, 36.0], egui::TextEdit::singleline(&mut location))
+                .changed()
+            {
+                self.create_path = (!location.is_empty()).then(|| PathBuf::from(&location));
+            }
+            if ui
+                .add_sized([48.0, 36.0], egui::Button::new("📁"))
+                .on_hover_text("Choose wallet location")
+                .clicked()
+            {
+                self.pick(Pick::Create);
+            }
+        });
+        self.hardware_ui(ui);
+        ui.add_enabled_ui(self.key_ready() && self.create_path.is_some(), |ui| {
             if theme::primary(ui, "Create wallet").clicked()
                 && let Some(path) = self.create_path.clone()
             {
-                self.send(Command::Create(path));
+                if self.unlocked.is_some() {
+                    self.send(Command::Create(path));
+                } else {
+                    self.prepare_selected_key();
+                }
             }
-        }
-        if ui.button("Choose a different folder…").clicked() {
-            self.pick(Pick::Create);
+        });
+    }
+
+    fn enrollment(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Create enrollment bundle");
+        self.hardware_ui(ui);
+        ui.add_enabled_ui(self.key_ready(), |ui| {
+            if theme::primary(ui, "Export enrollment bundle…").clicked() {
+                if self.unlocked.is_some() {
+                    self.pick(Pick::ExportParticipant);
+                } else {
+                    self.prepare_selected_key();
+                }
+            }
+        });
+    }
+
+    pub(super) fn key_ready(&self) -> bool {
+        self.unlocked.is_some()
+            || (!self.provision
+                && self.inspected_slots.as_ref().is_some_and(|slots| {
+                    slots.contains(&self.encryption_slot) && slots.contains(&self.signing_slot)
+                })
+                && self.encryption_slot != self.signing_slot)
+    }
+
+    pub(super) fn prepare_selected_key(&mut self) {
+        if let Ok(slots) = kagitaba_device::Slots::new(self.encryption_slot, self.signing_slot) {
+            self.use_prepared = true;
+            self.send(Command::UsePreparedKey(slots));
         }
     }
 
     fn unlock_prompt(&mut self, ui: &mut egui::Ui) {
         ui.heading("Wallet locked");
-        ui.label("Unlock your key to view credentials and make changes.");
+        theme::caption(ui, "Unlock your key to view credentials and make changes.");
         if theme::primary(ui, "Unlock…").clicked() {
             self.screen = Screen::Unlock;
             self.send(Command::Scan);
@@ -413,51 +764,34 @@ impl App {
             if ui.button("Backups & updates").clicked() {
                 self.navigate(Leave::Screen(Screen::Transfer));
             }
-            if let Some(path) = self.wallet.clone() {
-                let favorite = self.preferences.favorites.contains(&path);
-                if ui
-                    .button(if favorite {
-                        "★ Favorite"
-                    } else {
-                        "☆ Favorite"
-                    })
-                    .clicked()
-                {
-                    self.preferences.toggle_favorite(&path);
-                    self.save_preferences();
-                }
-            }
         });
         if self.unlocked.is_none() {
             self.unlock_prompt(ui);
         }
         ui.separator();
-        if ui.available_width() >= 780.0 {
+        let width = ui.available_width();
+        if width >= 680.0 {
             let height = ui.available_height();
-            let detail_width = ui.available_width() - 320.0;
             ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(290.0, height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        self.entry_list(ui);
-                    },
-                );
+                ui.allocate_ui_with_layout(egui::vec2(190.0, height), egui::Layout::top_down(egui::Align::Min), |ui| self.collection_tree(ui));
                 ui.separator();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(detail_width, height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("entry-detail")
-                            .show(ui, |ui| {
-                                ui.set_min_width((ui.available_width() - 1.0).max(0.0));
-                                theme::surface().show(ui, |ui| self.entry_ui(ui));
-                            });
-                    },
-                );
+                let list_width = if width >= 1100.0 { 300.0 } else { ui.available_width() };
+                ui.allocate_ui_with_layout(egui::vec2(list_width, height), egui::Layout::top_down(egui::Align::Min), |ui| self.entry_list(ui));
+                if width >= 1100.0 {
+                    ui.separator();
+                    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        egui::ScrollArea::vertical().id_salt("entry-detail").show(ui, |ui| {
+                            ui.set_min_width((ui.available_width() - 1.0).max(0.0));
+                            theme::surface().show(ui, |ui| { ui.set_min_width(ui.available_width()); self.entry_ui(ui); });
+                        });
+                    });
+                }
             });
         } else {
+            egui::CollapsingHeader::new("Collections").default_open(true).show(ui, |ui| {
+                ui.scope(|ui| { ui.set_max_height(180.0); self.collection_tree(ui); });
+            });
+            ui.separator();
             self.entry_list(ui);
         }
     }
@@ -501,6 +835,7 @@ impl App {
                 });
                 self.touch_progress_ui(ui);
                 egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                     .id_salt("modal-details")
                     .auto_shrink([false, false])
                     .max_height(ui.available_height().max(100.0))
@@ -519,8 +854,8 @@ impl App {
                 ui.set_max_width((ctx.content_rect().width() - 80.0).min(520.0));
                 ui.heading("Verify this wallet");
                 ui.label(path.display().to_string());
-                ui.label("First open: compare this signing fingerprint with a trusted device or backup record.");
-                ui.label(&fingerprint);
+                theme::caption(ui, "First open: compare this signing fingerprint with a trusted device or backup record.");
+                ui.monospace(&fingerprint);
                 ui.add_enabled_ui(!self.busy, |ui| {
                     if theme::primary(ui, "Trust signer & open wallet").clicked() {
                         self.trust = None;

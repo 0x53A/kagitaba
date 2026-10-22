@@ -56,6 +56,82 @@ fn blocked_pin_and_invalid_input_do_not_retry() {
     assert!(matches!(card.verify_pin("x"), Err(Error::InvalidPin)));
     assert!(matches!(card.verify_pin("123456"), Err(Error::Blocked)));
 }
+
+fn verified_pin_step() -> (Vec<u8>, Vec<u8>) {
+    (vec![0, 0x20, 0, 0x80, 8, b'1', b'2', b'3', b'4', b'5', b'6', 0xff, 0xff], vec![0x90, 0])
+}
+fn p256_metadata() -> Vec<u8> {
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    let point = p256::SecretKey::from_slice(&[7;32]).unwrap().public_key().to_sec1_point(false);
+    let mut response = vec![1, 1, 0x11, 4, 67, 0x86, 65];
+    response.extend_from_slice(point.as_bytes());
+    response.extend([0x90, 0]);
+    response
+}
+#[test]
+fn prepared_card_finds_all_p256_slots_and_uses_selected_pair_without_reentering_pin() {
+    let mut steps = vec![verified_pin_step()];
+    for slot in 0x82..=0x95 {
+        let response = match slot {
+            0x84 | 0x87 | 0x95 => p256_metadata(),
+            0x85 => vec![1, 1, 7, 0x90, 0], // RSA occupied slot, never a usable P-256 slot.
+            _ => vec![0x6a, 0x88],
+        };
+        steps.push((vec![0, 0xf7, 0, slot], response));
+    }
+    steps.extend([(vec![0, 0xf7, 0, 0x87], p256_metadata()), (vec![0, 0xf7, 0, 0x95], p256_metadata())]);
+    let mut card = AuthenticatedPiv::new(script(steps), "123456").unwrap();
+    assert_eq!(card.p256_slots().unwrap(), vec![0x84, 0x87, 0x95]);
+    card.use_slots(Slots::new(0x87, 0x95).unwrap()).unwrap();
+}
+#[test]
+fn prepared_card_checks_both_slots_before_any_management_authentication_or_write() {
+    let card = AuthenticatedPiv::new(script(vec![verified_pin_step(),
+        (vec![0, 0xf7, 0, 0x82], vec![0x6a, 0x88]),
+        (vec![0, 0xf7, 0, 0x83], vec![1, 1, 7, 0x90, 0]),
+    ]), "123456").unwrap();
+    assert!(matches!(card.provision(Slots::default(), &[0;24]), Err(Error::Occupied)));
+    let mut card = AuthenticatedPiv::new(script(vec![verified_pin_step(),
+        (vec![0, 0xf7, 0, 0x82], vec![0x6d, 0]),
+    ]), "123456").unwrap();
+    assert!(matches!(card.p256_slots(), Err(Error::Status(0x6d00))));
+}
+#[test]
+fn prepared_provision_verifies_pin_only_once_and_returns_the_created_pair() {
+    for custom in [false, true] {
+    let management = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+    let mut challenge = vec![0x7c, 18, 0x81, 16];
+    challenge.extend(hex::decode("00112233445566778899aabbccddeeff").unwrap());
+    challenge.extend([0x90, 0]);
+    let mut auth = vec![0, 0x87, 8, 0x9b, 20, 0x7c, 18, 0x82, 16];
+    auth.extend(hex::decode("69c4e0d86a7b0430d8cdb78070b4c55a").unwrap());
+    let mut steps = vec![verified_pin_step(),
+        (vec![0, 0xf7, 0, 0x82], vec![0x6a, 0x88]),
+        (vec![0, 0xf7, 0, 0x83], vec![0x6a, 0x88]),
+        (vec![0, 0xf7, 0, 0x9b], vec![1, 1, 8, 0x90, 0]),
+        (vec![0, 0x87, 8, 0x9b, 4, 0x7c, 2, 0x81, 0], challenge),
+        (auth, vec![0x90, 0]),
+    ];
+    for (slot, touch) in if custom { [(0x82,1), (0x83,3)] } else { [(0x82,3), (0x83,2)] } {
+        let metadata = p256_metadata();
+        let mut generated = vec![0x7f, 0x49, 67, 0x86, 65];
+        generated.extend_from_slice(&metadata[7..72]);
+        generated.extend([0x90, 0]);
+        steps.push((vec![0, 0xf7, 0, slot], vec![0x6a, 0x88]));
+        steps.push((vec![0, 0x47, 0, slot, 11, 0xac, 9, 0x80, 1, 0x11, 0xaa, 1, 2, 0xab, 1, touch], generated));
+    }
+    steps.extend([(vec![0, 0xf7, 0, 0x82], p256_metadata()), (vec![0, 0xf7, 0, 0x83], p256_metadata())]);
+    let card = AuthenticatedPiv::new(script(steps), "123456").unwrap();
+    if custom {
+        card.provision_with_policies(Slots::default(), &management, Policies {
+            encryption: KeyPolicy { pin: PinPolicy::Once, touch: TouchPolicy::Never },
+            signing: KeyPolicy { pin: PinPolicy::Once, touch: TouchPolicy::Cached },
+        }).unwrap();
+    } else {
+        card.provision(Slots::default(), &management).unwrap();
+    }
+    }
+}
 #[test]
 fn provisioning_never_overwrites_occupied_or_unknown_slots() {
     let mut card = script(vec![
@@ -242,6 +318,10 @@ fn exercise_session(slots: Slots) {
             let mut out = match apdu[1] {
                 0xa4 => vec![],
                 0x20 => {
+                    self.verified = false;
+                    if &apdu[5..] != b"123456\xff\xff" {
+                        return Ok(Zeroizing::new(vec![0x63, 0xc2]));
+                    }
                     self.verified = true;
                     vec![]
                 }
@@ -316,6 +396,8 @@ fn exercise_session(slots: Slots) {
     let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed = events.clone();
     session.set_observer(move |event| observed.lock().unwrap().push(event));
+    assert!(matches!(session.verify_pin("654321"), Err(Error::Pin(2))));
+    session.verify_pin("123456").unwrap();
     let mut rng = ChaCha20Rng::from_seed([3; 32]);
     let key = ContentKey::generate(&mut rng).unwrap();
     let wrap = WrappedKey::wrap(&key, &session.encryption, b"fixture", &mut rng).unwrap();
