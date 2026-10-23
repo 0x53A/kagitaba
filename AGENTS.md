@@ -65,10 +65,10 @@ including loose and packed/delta Git objects. Native add/export/revocation use
 1 MiB crypto chunks. JSON browser/JNI transfer bridges remain buffered; the store
 also exposes a streaming transfer writer. Older readers that reject
 attachment paths must be upgraded before opening wallets containing attachments.
-These attachment reader changes currently describe source support. The previously
-signed Firefox 0.1.2 XPI predates attachment support; its unchanged source version
-number is not evidence of an upgraded installed artifact. Build and validate new
-client artifacts before sharing attachment-bearing wallets with those clients.
+Firefox 0.1.3 has been built, signed and validated with attachment-bearing
+native/browser round trips. The previously signed Firefox 0.1.2 XPI predates
+attachment support; installed clients must be upgraded before sharing
+attachment-bearing wallets with them.
 
 Public keys use canonical DER SubjectPublicKeyInfo, optionally PEM `PUBLIC KEY`.
 The key ID is lowercase hex SHA-256(canonical DER), not a hash of the PEM text.
@@ -512,6 +512,18 @@ with the extension; the design document is not evidence of completed validation.
 Use the project `shell.nix` (`.envrc` contains `use nix`). System Rust executables
 are rustup shims without a configured default. Use cargo to change dependencies.
 The current Nix Rust package also ships `wasm32-unknown-unknown` standard libraries.
+The development profile uses optimization level 1, retaining debug information
+and assertions while avoiding unoptimized bulk crypto/JSON costs.
+
+Full-history verification reuses already validated, unchanged entry subtrees
+within a single traversal, keyed by entry ID and Git tree ID. Its reuse map is
+limited to the previous snapshot; every commit signature, signer authorization,
+snapshot membership, merge result and transition is still checked. Reused trees
+still consume snapshot file/byte budgets. Nothing persists as a trust shortcut.
+Immutable primary records retain their canonical digest in memory; wire formats
+are unchanged. Cloned immutable primary/grant records share their opaque owned
+body bytes; there is no mutable body accessor. Core batch entry replacement/removal APIs preserve validation and
+copy a snapshot once for bulk edits.
 
 ```
 nix-shell --run 'cargo test'

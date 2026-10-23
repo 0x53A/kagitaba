@@ -96,6 +96,7 @@ impl PendingAccess {
             .get(&self.target)
             .ok_or("Participant is no longer enrolled")?;
         let mut next = snapshot.clone();
+        let mut updates = Vec::new();
         for id in &self.entries {
             let entry = snapshot
                 .wallet
@@ -127,8 +128,9 @@ impl PendingAccess {
                 self.target,
                 wrapped.as_bytes().to_vec(),
             )?)?;
-            next.wallet = next.wallet.with_entry(updated)?;
+            updates.push(updated);
         }
+        next.wallet = next.wallet.with_entries(updates)?;
         next.validate()?;
         Ok(next)
     }

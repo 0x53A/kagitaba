@@ -140,6 +140,9 @@ Its embedded font metadata also retains the copyright and license notices.
 Always/Cached/Never guidance reflects reported policies. This reports a pending command, not a card-provided
 touch-wait signal. It clears on completion/failure/lock and late events cannot
 restore it after lock. No PIN is retained for these notifications.
+Generic work and private-operation guidance share one progress row. While busy,
+the row reserves space for wrapped policy guidance so repeated private commands
+do not shift the controls below it; generic work does not suggest touching a key.
 If setup fails after generating one key, that generated key remains. The current
 UI refuses partial setup instead of guessing how to reuse an occupied slot.
 
@@ -379,6 +382,10 @@ clearing is immediate even while the worker is busy; only the worker's explicit
 lock completion releases suppression. A hardware operation already
 submitted may finish before the queued lock; lock is not transaction cancellation.
 Index decryption follows explicit unlock; decrypted rows are kept only in memory.
+Current index refreshes reuse their authenticated ciphertext instead of encoding
+and encrypting it again. A cold index still decrypts each accessible credential
+once; a valid persisted index needs only its key unwrap. Bulk grant completion,
+access changes and duplicate/import cleanup batch immutable wallet replacements.
 Editor widget IDs include the
 entry and replacement epoch; text undo state is discarded on entry/snapshot
 replacement and lock. Encrypted entries can be selected and deleted even if

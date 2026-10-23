@@ -272,3 +272,27 @@ fn snapshot_loading_rejects_duplicate_and_unknown_records() {
         Err(Error::Duplicate)
     );
 }
+
+#[test]
+fn cached_primary_digest_matches_wire_and_batch_updates_remain_atomic() {
+    use sha2::{Digest, Sha256};
+    let mut rng = rng();
+    let identity = SoftwareIdentity::from_bytes(&[17; 32]).unwrap();
+    let key = identity.public_key();
+    let first = encrypt_revision(EntryId::from_bytes([1; 16]), b"first", std::slice::from_ref(&key), &mut rng);
+    let second = encrypt_revision(EntryId::from_bytes([2; 16]), b"second", std::slice::from_ref(&key), &mut rng);
+    let wire = first.primary().to_bytes();
+    let expected: [u8; 32] = Sha256::digest(&wire).into();
+    assert_eq!(first.primary().digest(), expected);
+    assert_eq!(PrimaryRecord::from_bytes(&wire).unwrap().digest(), expected);
+    let original = Wallet::from_parts([key], [first.clone()]).unwrap();
+    assert_eq!(original.with_entries([second.clone()]).unwrap(), original.with_entry(second.clone()).unwrap());
+    assert!(matches!(original.with_entries([second.clone(), second.clone()]), Err(Error::Duplicate)));
+    let reused = PrimaryRecord::new(first.primary().entry_id(), first.primary().revision_id(), b"changed".to_vec()).unwrap();
+    assert!(matches!(original.with_entries([second.clone(), Entry::from_parts(reused, []).unwrap()]), Err(Error::ReusedRevision)));
+    assert_eq!(original.entries().len(), 1);
+    let batch = original.with_entries([second]).unwrap();
+    assert!(batch.without_entries([EntryId::from_bytes([1; 16]), EntryId::from_bytes([9; 16])]).is_err());
+    assert_eq!(batch.entries().len(), 2);
+    assert!(batch.without_entries(batch.entries().keys().copied()).unwrap().entries().is_empty());
+}

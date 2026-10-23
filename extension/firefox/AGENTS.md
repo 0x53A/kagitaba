@@ -19,8 +19,8 @@ Firefox currently preserves these caches without using them for its own listing.
 Upgrade all replica readers before using native writers that introduce these
 paths: the previously signed 0.1.1 standalone add-on rejects them. Its native
 gateway does not read wallet Git history and is unaffected. The current signed package
-is `../../target/kagitaba-firefox-0.1.2-signed.xpi`; older signed artifacts
-are unchanged. Version 0.1.2 includes these reader and UI changes.
+is `../../target/kagitaba-firefox-0.1.3-signed.xpi`; older signed artifacts
+are unchanged. Version 0.1.2 introduced these index reader and UI changes.
 
 2026-10-20 UI/index-reader validation: Node regressions, browser Rust tests, real
 WASM native-history interoperability, Firefox wallet/credential smoke,
@@ -429,3 +429,14 @@ These summaries use the existing unlocked payload cache; lock clears them.
 Passkey details show RP, account/display names, copyable credential ID, concealed
 user handle with explicit reveal, and recorded backup flags (Not recorded when
 absent). Private-key material is omitted from this normal view.
+
+2026-10-22: Version 0.1.3 signed by Mozilla for unlisted distribution (AMO version
+6610415). Artifact: `../../target/kagitaba-firefox-0.1.3-signed.xpi` with SHA-256
+sidecar. Reviewer source rebuild reproduces the unsigned package byte-for-byte;
+signed assets match, with unchanged manifest semantics. Firefox 158 accepted
+permanent installation in a disposable profile with signature enforcement enabled.
+Node regressions, real WASM/native interoperability (including large attachments),
+and Firefox credential smoke passed; hardware PRF was simulated. Source and
+verification records: `../../target/firefox-signing/0.1.3/`. Normal browser
+profiles were untouched. This build includes attachment reader and imported
+passkey backup-flag support; older installed builds still require upgrading.

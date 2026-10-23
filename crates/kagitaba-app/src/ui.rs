@@ -338,7 +338,11 @@ impl App {
         };
         if self.tx.send(c).is_ok() {
             self.busy = true;
-            self.status = "Working… Touch your key if it blinks.".into();
+            self.status = if matches!(self.operation, Operation::Open) {
+                "Opening wallet and verifying signed history…"
+            } else {
+                "Working…"
+            }.into();
         }
     }
     fn clear_gateway(&mut self) {

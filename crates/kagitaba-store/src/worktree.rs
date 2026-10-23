@@ -185,7 +185,7 @@ impl Drop for Update {
 fn committed_files(repo: &gix::Repository, id: ObjectId) -> Result<Files> {
     let mut files = Files::new();
     let mut budget = MAX_SNAPSHOT;
-    read_tree(repo, commit(repo, id)?.tree, "", &mut files, &mut budget, 0)?;
+    read_tree(repo, commit(repo, id)?.tree, "", &mut files, &mut budget, 0, &mut None)?;
     Ok(files)
 }
 

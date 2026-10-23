@@ -220,19 +220,29 @@ pub(super) fn verify_history(
         return Err(Error::Checkpoint);
     }
     let graph: Graph = ordered.iter().cloned().collect();
-    for (_, mut c) in ordered {
+    // Keep only the last verified snapshot. Linear history then reads each tree
+    // once, without retaining a wallet-sized snapshot for every commit/branch.
+    let mut previous: Option<(ObjectId, Snapshot)> = None;
+    let mut reader = snapshot_reader::SnapshotReader::default();
+    for (id, mut c) in ordered {
         let sig = signature(&c)?;
         let key = signing::from_ssh(sig.public_key())?;
-        let current = read_snapshot(repo, c.tree)?;
+        let current = reader.read(repo, c.tree, previous.as_ref().map(|(_, snapshot)| snapshot))?;
         if c.parents.is_empty() && (&key != root || !current.signers.values().any(|k| k == root)) {
             return Err(Error::Signature);
         }
         for parent in &c.parents {
-            let old = read_snapshot(repo, graph[parent].tree)?;
+            let loaded;
+            let old = if let Some((_, snapshot)) = previous.as_ref().filter(|(id, _)| id == parent) {
+                snapshot
+            } else {
+                loaded = read_snapshot(repo, graph[parent].tree)?;
+                &loaded
+            };
             if !old.signers.values().any(|k| k == &key) {
                 return Err(Error::Signature);
             }
-            validate_transition(&old, &current)?;
+            validate_transition(old, &current)?;
         }
         c.extra_headers.clear();
         ssh_public(&key)?
@@ -244,6 +254,10 @@ pub(super) fn verify_history(
                 return Err(Error::Conflict);
             }
         }
+        previous = Some((id, current));
     }
-    read_snapshot(repo, graph[&head].tree)
+    previous
+        .filter(|(id, _)| *id == head)
+        .map(|(_, snapshot)| snapshot)
+        .ok_or(Error::History)
 }

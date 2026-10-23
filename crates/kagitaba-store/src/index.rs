@@ -226,7 +226,8 @@ impl Index {
         backend: &impl KeyAgreement,
         previous: Option<&Index>,
     ) -> Result<Self> {
-        if !snapshot.wallet.participants().contains_key(&recipient.id()) {
+        let participant = recipient.id();
+        if !snapshot.wallet.participants().contains_key(&participant) {
             return Err(Error::Invalid);
         }
         let mut rows = BTreeMap::new();
@@ -234,7 +235,7 @@ impl Index {
             if snapshot.is_metadata(id) {
                 continue;
             }
-            let Some(grant) = entry.grants().get(&recipient.id()) else {
+            let Some(grant) = entry.grants().get(&participant) else {
                 continue;
             };
             let digest = entry.primary().digest();
@@ -253,7 +254,7 @@ impl Index {
             rows.insert(*id, row);
         }
         let index = Self {
-            fingerprint: fingerprint(snapshot, recipient.id()),
+            fingerprint: fingerprint(snapshot, participant),
             rows,
         };
         Ok(index)

@@ -467,15 +467,7 @@ impl App {
             });
         }
         ui.separator();
-        self.touch_progress_ui(ui);
-        if self.busy || !self.status.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                if self.busy {
-                    ui.spinner();
-                }
-                ui.label(&self.status);
-            });
-        }
+        self.progress_ui(ui);
         if let Some(error) = &self.preference_error {
             ui.colored_label(theme::ERROR, error);
         }
@@ -796,17 +788,53 @@ impl App {
         }
     }
 
-    fn touch_progress_ui(&self, ui: &mut egui::Ui) {
-        if let Some(policy) = self.private_operation {
-            ui.horizontal_wrapped(|ui| {
-                ui.spinner();
-                ui.colored_label(theme::AQUA, match policy {
-                    Some(TouchPolicy::Always) => "Waiting for YubiKey confirmation — touch the key when it flashes.",
-                    Some(TouchPolicy::Cached) => "YubiKey operation pending — touch if it flashes; a recent touch may still be cached.",
-                    Some(TouchPolicy::Never) => "Waiting for the YubiKey — no touch required by this slot.",
-                    None | Some(TouchPolicy::Unknown(_)) => "YubiKey operation pending — touch the key if it flashes (policy unavailable).",
-                });
-            });
+    fn progress_ui(&self, ui: &mut egui::Ui) {
+        const MESSAGES: [&str; 4] = [
+            "Waiting for YubiKey confirmation — touch the key when it flashes.",
+            "YubiKey operation pending — touch if it flashes; a recent touch may still be cached.",
+            "Waiting for the YubiKey — no touch required by this slot.",
+            "YubiKey operation pending — touch the key if it flashes (policy unavailable).",
+        ];
+        if self.busy || self.private_operation.is_some() {
+            let message = match self.private_operation {
+                Some(Some(TouchPolicy::Always)) => MESSAGES[0],
+                Some(Some(TouchPolicy::Cached)) => MESSAGES[1],
+                Some(Some(TouchPolicy::Never)) => MESSAGES[2],
+                Some(_) => MESSAGES[3],
+                None => &self.status,
+            };
+            // Private commands can start/finish repeatedly during one worker job.
+            // Reserve the same space for every policy, including wrapped text,
+            // so those notifications don't move the controls below the banner.
+            let text_width =
+                (ui.available_width() - 20.0 - ui.spacing().item_spacing.x).max(1.0);
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let height = MESSAGES.iter().chain(std::iter::once(&message)).fold(
+                36.0_f32,
+                |height, text| {
+                    height.max(
+                        ui.painter()
+                            .layout((*text).into(), font.clone(), theme::INK, text_width)
+                            .size()
+                            .y,
+                    )
+                },
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(egui::Spinner::new().size(20.0));
+                    let color = if self.private_operation.is_some() {
+                        theme::AQUA
+                    } else {
+                        theme::INK
+                    };
+                    ui.add(egui::Label::new(egui::RichText::new(message).color(color)).wrap());
+                },
+            );
+        } else if !self.status.is_empty() {
+            ui.label(&self.status);
         }
     }
     fn entry_modal(&mut self, ctx: &egui::Context) {
@@ -833,7 +861,7 @@ impl App {
                         self.request_lock();
                     }
                 });
-                self.touch_progress_ui(ui);
+                self.progress_ui(ui);
                 egui::ScrollArea::vertical()
                             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                     .id_salt("modal-details")
@@ -873,4 +901,55 @@ fn wallet_name(path: &std::path::Path) -> String {
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn progress_has_one_message_and_stable_geometry_across_private_commands() {
+        for width in [440.0, 855.0, 1400.0] {
+            let (tx, _) = mpsc::channel();
+            let (_, rx) = mpsc::channel();
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            let mut app = App::state(ctx.clone(), tx, rx);
+            app.busy = true;
+            app.status = "Working…".into();
+            let mut baseline = None;
+            for policy in [None, Some(Some(TouchPolicy::Cached)), Some(Some(TouchPolicy::Always)), Some(Some(TouchPolicy::Never)), Some(None), None] {
+                app.private_operation = policy;
+                for frame in 0..4 {
+                    let mut next_control = egui::Rect::NOTHING;
+                    let mut output = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 780.0))),
+                        time: Some(frame as f64 * 0.1),
+                        ..Default::default()
+                    }, |ui| {
+                        app.progress_ui(ui);
+                        next_control = ui.button("Import…").rect;
+                    });
+                    output.textures_delta.clear();
+                    if let Some(expected) = baseline {
+                        assert_eq!(next_control, expected, "width {width}, policy {policy:?}");
+                    } else {
+                        baseline = Some(next_control);
+                    }
+                    let texts: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                        _ => None,
+                    }).collect();
+                    assert_eq!(texts.len(), 2, "one progress label and one button: {texts:?}");
+                    assert_eq!(texts.contains(&"Working…"), policy.is_none());
+                }
+            }
+            app.busy = false;
+            app.status = "Completed".into();
+            let mut output = ctx.run_ui(Default::default(), |ui| app.progress_ui(ui));
+            output.textures_delta.clear();
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Completed")));
+        }
+    }
 }

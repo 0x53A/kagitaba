@@ -6,7 +6,7 @@
 //! The application validates signatures/trust before constructing a snapshot.
 
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use crate::{EntryId, Error, KeyId, Result, RevisionId, crypto::PublicKey};
 
@@ -22,7 +22,8 @@ const GRANT_HEADER: usize = 100;
 pub struct PrimaryRecord {
     entry: EntryId,
     revision: RevisionId,
-    body: Vec<u8>,
+    body: Arc<[u8]>,
+    digest: [u8; 32],
 }
 
 impl PrimaryRecord {
@@ -31,10 +32,16 @@ impl PrimaryRecord {
         if body.len() > MAX_PRIMARY_BYTES {
             return Err(Error::SizeLimit);
         }
+        let mut hash = Sha256::new();
+        hash.update(b"KTP1");
+        hash.update(entry.as_bytes());
+        hash.update(revision.as_bytes());
+        hash.update(&body);
         Ok(Self {
             entry,
             revision,
-            body,
+            body: body.into(),
+            digest: hash.finalize().into(),
         })
     }
 
@@ -62,7 +69,7 @@ impl PrimaryRecord {
 
     /// SHA-256 of the complete canonical primary record, including its identity.
     pub fn digest(&self) -> [u8; 32] {
-        Sha256::digest(self.to_bytes()).into()
+        self.digest
     }
 
     /// Context binding a cryptographic grant to this primary and recipient.
@@ -109,7 +116,7 @@ pub struct GrantRecord {
     revision: RevisionId,
     recipient: KeyId,
     primary_digest: [u8; 32],
-    body: Vec<u8>,
+    body: Arc<[u8]>,
 }
 
 impl GrantRecord {
@@ -123,7 +130,7 @@ impl GrantRecord {
             revision: primary.revision,
             recipient,
             primary_digest: primary.digest(),
-            body,
+            body: body.into(),
         })
     }
 
@@ -176,7 +183,7 @@ impl GrantRecord {
             revision: RevisionId::from_bytes(read_array(&bytes[20..36])?),
             recipient: KeyId::from_bytes(read_array(&bytes[36..68])?),
             primary_digest: read_array(&bytes[68..100])?,
-            body: bytes[GRANT_HEADER..].to_vec(),
+            body: bytes[GRANT_HEADER..].into(),
         })
     }
 }
@@ -294,25 +301,43 @@ impl Wallet {
     /// Fresh cryptographic keys are the responsibility of the application using
     /// the crypto layer: this layer cannot interpret the opaque bodies.
     pub fn with_entry(&self, entry: Entry) -> Result<Self> {
-        self.validate_entry(&entry)?;
-        if let Some(old) = self.entries.get(&entry.primary.entry)
-            && old.primary != entry.primary
-            && old.primary.revision == entry.primary.revision
-        {
-            return Err(Error::ReusedRevision);
-        }
+        self.with_entries([entry])
+    }
+
+    /// Apply distinct entry replacements atomically, copying the snapshot once.
+    /// Each replacement has the same validation and revision rules as `with_entry`.
+    pub fn with_entries(&self, entries: impl IntoIterator<Item = Entry>) -> Result<Self> {
         let mut next = self.clone();
-        next.entries.insert(entry.primary.entry, entry);
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in entries {
+            self.validate_entry(&entry)?;
+            if !seen.insert(entry.primary.entry) {
+                return Err(Error::Duplicate);
+            }
+            if let Some(old) = self.entries.get(&entry.primary.entry)
+                && old.primary != entry.primary
+                && old.primary.revision == entry.primary.revision
+            {
+                return Err(Error::ReusedRevision);
+            }
+            next.entries.insert(entry.primary.entry, entry);
+        }
         Ok(next)
     }
 
     /// Remove an entry in a new snapshot. Historical snapshots remain readable.
     pub fn without_entry(&self, id: EntryId) -> Result<Self> {
-        if !self.entries.contains_key(&id) {
-            return Err(Error::NotFound);
-        }
+        self.without_entries([id])
+    }
+
+    /// Remove distinct entries atomically, copying the snapshot once.
+    pub fn without_entries(&self, ids: impl IntoIterator<Item = EntryId>) -> Result<Self> {
         let mut next = self.clone();
-        next.entries.remove(&id);
+        for id in ids {
+            if next.entries.remove(&id).is_none() {
+                return Err(Error::NotFound);
+            }
+        }
         Ok(next)
     }
 

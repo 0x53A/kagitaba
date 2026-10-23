@@ -10,6 +10,7 @@ pub mod index;
 mod metadata;
 mod participant_name;
 mod signing;
+mod snapshot_reader;
 mod transfer;
 mod worktree;
 pub use device_hint::DeviceHint;
@@ -818,8 +819,9 @@ fn read_tree(
     files: &mut Files,
     budget: &mut usize,
     depth: usize,
+    reuse: &mut Option<snapshot_reader::Reuse<'_>>,
 ) -> Result<()> {
-    if depth > 5 || files.len() > MAX_FILES {
+    if depth > 5 || files.len() + reuse.as_ref().map_or(0, |r| r.skipped_files) > MAX_FILES {
         return Err(Error::Invalid);
     }
     if repo.find_header(id).map_err(|_| Error::Invalid)?.size() > 16 * 1024 * 1024 {
@@ -842,14 +844,20 @@ fn read_tree(
         }
         let path = format!("{prefix}{name}");
         match e.mode.kind() {
-            EntryKind::Tree => read_tree(
-                repo,
-                e.oid.to_owned(),
-                &(path + "/"),
-                files,
-                budget,
-                depth + 1,
-            )?,
+            EntryKind::Tree => {
+                let oid = e.oid.to_owned();
+                if let Some(reuse) = reuse.as_mut()
+                    && reuse.reuse(&path, oid, budget)?
+                {
+                    continue;
+                }
+                let before_files = files.len();
+                let before_bytes = *budget;
+                read_tree(repo, oid, &(path.clone() + "/"), files, budget, depth + 1, reuse)?;
+                if let Some(reuse) = reuse.as_mut() {
+                    reuse.record(&path, oid, files.len() - before_files, before_bytes - *budget)?;
+                }
+            }
             EntryKind::Blob => {
                 let parts: Vec<_> = path.split('/').collect();
                 let limit = match parts.as_slice() {
@@ -904,10 +912,17 @@ fn read_snapshot(repo: &gix::Repository, tree: ObjectId) -> Result<Snapshot> {
 fn read_files(repo: &gix::Repository, tree: ObjectId) -> Result<Files> {
     let mut files = Files::new();
     let mut budget = MAX_SNAPSHOT;
-    read_tree(repo, tree, "", &mut files, &mut budget, 0)?;
+    read_tree(repo, tree, "", &mut files, &mut budget, 0, &mut None)?;
     Ok(files)
 }
-fn snapshot_from_files(mut files: Files) -> Result<Snapshot> {
+fn snapshot_from_files(files: Files) -> Result<Snapshot> {
+    snapshot_from_files_with_entries(files, Vec::new(), BTreeMap::new())
+}
+fn snapshot_from_files_with_entries(
+    mut files: Files,
+    mut entries: Vec<Entry>,
+    mut attachments: BTreeMap<EntryId, BTreeMap<String, AttachmentBlob>>,
+) -> Result<Snapshot> {
     if files.len() > MAX_FILES || files.values().map(FileData::len).sum::<usize>() > MAX_SNAPSHOT {
         return Err(Error::Invalid);
     }
@@ -920,7 +935,6 @@ fn snapshot_from_files(mut files: Files) -> Result<Snapshot> {
         return Err(Error::Invalid);
     }
     let mut index_keys = BTreeMap::new();
-    let mut attachments: BTreeMap<EntryId, BTreeMap<String, AttachmentBlob>> = BTreeMap::new();
     let mut indexes = BTreeMap::new();
     let mut keys = BTreeMap::new();
     let mut signers = BTreeMap::new();
@@ -1007,7 +1021,6 @@ fn snapshot_from_files(mut files: Files) -> Result<Snapshot> {
             _ => return Err(Error::Invalid),
         }
     }
-    let mut entries = Vec::new();
     for (id, primary) in primaries {
         entries.push(Entry::from_parts(
             primary,

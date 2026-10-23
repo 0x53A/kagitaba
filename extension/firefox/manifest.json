@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Kagitaba",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "An encrypted participant wallet, password manager and software passkey provider.",
   "browser_specific_settings": {
     "gecko": {

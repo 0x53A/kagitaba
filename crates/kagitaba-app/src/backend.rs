@@ -6,6 +6,8 @@ pub use copy_workflow::CopyPreview;
 mod import_files;
 #[cfg(test)]
 mod import_original_tests;
+#[cfg(test)]
+mod performance_tests;
 mod import_duplicates;
 pub mod duplicates;
 pub mod import_preview;
@@ -944,6 +946,7 @@ struct CachedIndex {
     wrapped: Vec<u8>,
     key: ContentKey,
     index: kagitaba_store::index::Index,
+    sealed: Vec<u8>,
 }
 fn refresh_index_for_write(snapshot: &mut Snapshot, session: &Session<Usb>, cached: &mut Option<CachedIndex>) {
     refresh_index_for_write_with(snapshot, &session.encryption, session, cached);
@@ -965,6 +968,14 @@ fn refresh_index_with(snapshot: &mut Snapshot, recipient: &PublicKey, backend: &
         && snapshot.index_keys.get(&participant) == Some(&state.wrapped));
     let mut changed = false;
     let (key, previous) = if let Some(old) = old {
+        if old.index.is_current(snapshot, participant) {
+            if snapshot.indexes.get(&participant) != Some(&old.sealed) {
+                snapshot.indexes.insert(participant, old.sealed.clone());
+                changed = true;
+            }
+            *cached = Some(old);
+            return Ok(changed);
+        }
         (old.key, Some(old.index))
     } else {
         let key = match snapshot.provision_index_key(recipient, &mut rand::rngs::SysRng)? {
@@ -975,16 +986,21 @@ fn refresh_index_with(snapshot: &mut Snapshot, recipient: &PublicKey, backend: &
             .and_then(|bytes| kagitaba_store::index::Index::open(bytes, &key, participant).ok());
         (key, previous)
     };
-    let index = match previous {
-        Some(previous) if previous.is_current(snapshot, participant) => previous,
-        previous => block_on(kagitaba_store::index::Index::refresh(snapshot, recipient, backend, previous.as_ref()))?,
+    let (index, bytes) = match previous {
+        Some(previous) if previous.is_current(snapshot, participant) => {
+            (previous, snapshot.indexes[&participant].clone())
+        }
+        previous => {
+            let index = block_on(kagitaba_store::index::Index::refresh(snapshot, recipient, backend, previous.as_ref()))?;
+            let bytes = index.seal(&key, participant)?;
+            (index, bytes)
+        }
     };
-    let bytes = index.seal(&key, participant)?;
     if snapshot.indexes.get(&participant) != Some(&bytes) {
-        snapshot.indexes.insert(participant, bytes);
+        snapshot.indexes.insert(participant, bytes.clone());
         changed = true;
     }
-    *cached = Some(CachedIndex { participant, wrapped: snapshot.index_keys[&participant].clone(), key, index });
+    *cached = Some(CachedIndex { participant, wrapped: snapshot.index_keys[&participant].clone(), key, index, sealed: bytes });
     Ok(changed)
 }
 
@@ -1236,6 +1252,10 @@ mod index_tests {
         assert_eq!(backend.calls.get(),1); // Initial key generated locally; only entry decrypted.
         let wrapper=snapshot.index_keys[&recipient.id()].clone();
         let bytes=snapshot.indexes[&recipient.id()].clone();
+        snapshot.indexes.insert(recipient.id(), vec![0]);
+        assert!(refresh_index_with(&mut snapshot,&recipient,&backend,&mut cache).unwrap());
+        assert_eq!(snapshot.indexes[&recipient.id()],bytes);
+        assert_eq!(backend.calls.get(),1); // Restore authenticated cached bytes without another unwrap.
         assert!(!refresh_index_with(&mut snapshot,&recipient,&backend,&mut cache).unwrap());
         assert_eq!(backend.calls.get(),1);
         cache=None; // A fresh unlock/reopen has no retained index key or plaintext rows.

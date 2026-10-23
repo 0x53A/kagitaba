@@ -115,7 +115,7 @@ impl Snapshot {
         backend: &impl KeyAgreement,
         rng: &mut (impl TryCryptoRng + ?Sized),
     ) -> Result<bool> {
-        let mut changed = false;
+        let mut updates = Vec::new();
         for id in self.metadata.values() {
             let entry = &self.wallet.entries()[id];
             let missing = self
@@ -145,8 +145,11 @@ impl Snapshot {
                     wrapped.as_bytes().to_vec(),
                 )?)?;
             }
-            self.wallet = self.wallet.with_entry(updated)?;
-            changed = true;
+            updates.push(updated);
+        }
+        let changed = !updates.is_empty();
+        if changed {
+            self.wallet = self.wallet.with_entries(updates)?;
         }
         Ok(changed)
     }

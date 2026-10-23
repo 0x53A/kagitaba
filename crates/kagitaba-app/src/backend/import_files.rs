@@ -154,6 +154,7 @@ impl PendingImport {
         }
         for id in recipients { if !snapshot.wallet.participants().contains_key(id) { return Err("Unknown import recipient".into()); } }
         let mut next = snapshot.clone();
+        let mut updates = Vec::new();
         for survivor in self.duplicates.values().copied().collect::<BTreeSet<_>>() {
             let entry = next.wallet.entries().get(&survivor).ok_or("Duplicate survivor no longer exists")?;
             let original = Payload::open(entry, recipient, backend).await?;
@@ -161,7 +162,7 @@ impl PendingImport {
             if let Some(merged) = import_duplicates::merge_provenance(&original, &incoming)? {
                 let union = entry.grants().keys().copied().chain(recipients.iter().copied()).collect::<BTreeSet<_>>();
                 let keys = union.iter().map(|id| next.wallet.participants().get(id).cloned().ok_or("Unknown import recipient")).collect::<std::result::Result<Vec<_>, _>>()?;
-                next.wallet = next.wallet.with_entry(merged.seal(&keys, &mut rand::rngs::SysRng)?)?;
+                updates.push(merged.seal(&keys, &mut rand::rngs::SysRng)?);
                 continue;
             }
             let missing = recipients.iter().filter(|id| !entry.grants().contains_key(id)).copied().collect::<Vec<_>>();
@@ -174,8 +175,9 @@ impl PendingImport {
                 let wrapped = kagitaba_core::crypto::WrappedKey::wrap(&key, public, &entry.primary().grant_context(id), &mut rand::rngs::SysRng)?;
                 updated = updated.with_grant(kagitaba_core::wallet::GrantRecord::new(entry.primary(), id, wrapped.as_bytes().to_vec())?)?;
             }
-            next.wallet = next.wallet.with_entry(updated)?;
+            updates.push(updated);
         }
+        next.wallet = next.wallet.with_entries(updates)?;
         let mut entries = Vec::new();
         for payload in &self.entries {
             if self.duplicates.contains_key(&payload.entry_id()) { continue; }

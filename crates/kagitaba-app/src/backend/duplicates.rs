@@ -122,6 +122,7 @@ impl PendingDuplicates {
             .collect();
         let mut next = snapshot.clone();
         let mut merged_payloads = BTreeMap::new();
+        let mut updates = Vec::new();
         for ids in &self.groups {
             let recipients: BTreeSet<_> = ids
                 .iter()
@@ -140,7 +141,7 @@ impl PendingDuplicates {
             let incoming = ids[1..].iter().map(|id| &self.readable[id]).collect::<Vec<_>>();
             if let Some(merged) = super::import_duplicates::merge_provenance(&self.readable[&ids[0]], &incoming)? {
                 let keys = recipients.iter().map(|id| next.wallet.participants().get(id).cloned().ok_or("Unknown participant")).collect::<std::result::Result<Vec<_>, _>>()?;
-                next.wallet = next.wallet.with_entry(merged.seal(&keys, &mut rand::rngs::SysRng)?)?;
+                updates.push(merged.seal(&keys, &mut rand::rngs::SysRng)?);
                 merged_payloads.insert(ids[0], merged);
                 continue;
             }
@@ -181,8 +182,10 @@ impl PendingDuplicates {
                     wrapped.as_bytes().to_vec(),
                 )?)?;
             }
-            next.wallet = next.wallet.with_entry(updated)?;
+            updates.push(updated);
         }
+        next.wallet = next.wallet.with_entries(updates)?;
+        let mut updates = Vec::new();
         for (id, payload) in &self.readable {
             if remap.contains_key(id) {
                 continue;
@@ -207,12 +210,11 @@ impl PendingDuplicates {
                         .ok_or("Unknown participant")
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            next.wallet = next
-                .wallet
-                .with_entry(rewritten.seal(&keys, &mut rand::rngs::SysRng)?)?;
+            updates.push(rewritten.seal(&keys, &mut rand::rngs::SysRng)?);
         }
+        next.wallet = next.wallet.with_entries(updates)?;
+        next.wallet = next.wallet.without_entries(remap.keys().copied())?;
         for removed in remap.keys() {
-            next.wallet = next.wallet.without_entry(*removed)?;
             next.attachments.remove(removed);
         }
         next.validate()?;

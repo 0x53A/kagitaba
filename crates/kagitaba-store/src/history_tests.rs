@@ -989,3 +989,63 @@ fn opening_wallet_defers_attachment_contents_until_requested() {
     });
     assert!(result.is_err());
 }
+
+#[test]
+#[ignore = "synthetic wallet-open timing; run explicitly with --ignored --nocapture"]
+fn benchmark_open_linear_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = Key::new(3);
+    let mut snapshot = Snapshot::empty(encryption(8), key.public.clone()).unwrap();
+    for n in 1..=64 {
+        let primary = PrimaryRecord::new(
+            EntryId::from_bytes([n; 16]),
+            RevisionId::from_bytes([1; 16]),
+            vec![n; 32 * 1024],
+        ).unwrap();
+        let grant = GrantRecord::new(&primary, encryption(8).id(), vec![1]).unwrap();
+        snapshot.wallet = snapshot.wallet.with_entry(Entry::from_parts(primary, [grant]).unwrap()).unwrap();
+    }
+    let mut store = Store::create(dir.path(), snapshot, &key).unwrap();
+    for revision in 2..=20 {
+        put(&mut store, &key, entry(1, revision), "synthetic update");
+    }
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        let opened = Store::open(dir.path(), key.public.clone(), Some(store.head)).unwrap();
+        assert_eq!(opened.head, store.head);
+        eprintln!("synthetic open (20 commits, 64 entries): {:?}", start.elapsed());
+    }
+    let backup = tempfile::tempdir().unwrap();
+    let start = std::time::Instant::now();
+    store.backup_to(&backup.path().join("wallet")).unwrap();
+    eprintln!("synthetic backup: {:?}", start.elapsed());
+    let start = std::time::Instant::now();
+    store.export_transfer_to(&mut std::io::sink()).unwrap();
+    eprintln!("synthetic streaming transfer export: {:?}", start.elapsed());
+}
+
+#[test]
+fn reused_entry_trees_match_full_reads_and_still_validate_membership_and_changes() {
+    let (_dir, key, mut store, _) = pair();
+    put(&mut store, &key, entry(2, 1), "second entry");
+    put(&mut store, &key, entry(1, 2), "update first");
+    let mut reader = snapshot_reader::SnapshotReader::default();
+    let mut previous = None;
+    for (_, commit) in history(&store.repo, store.head).unwrap() {
+        let cached = reader.read(&store.repo, commit.tree, previous.as_ref()).unwrap();
+        let full = read_snapshot(&store.repo, commit.tree).unwrap();
+        assert!(files(&cached).unwrap() == files(&full).unwrap());
+        previous = Some(cached);
+    }
+    let mut invalid = files(previous.as_ref().unwrap()).unwrap();
+    invalid.retain(|path, _| !path.starts_with(&format!("participants/{}/", encryption(8).id())));
+    let tree = write_tree(&store.repo, &invalid).unwrap();
+    // Unchanged entry trees still contain grants to the removed participant.
+    assert!(reader.read(&store.repo, tree, previous.as_ref()).is_err());
+    let mut invalid = files(previous.as_ref().unwrap()).unwrap();
+    let id = EntryId::from_bytes([1; 16]);
+    invalid.insert(format!("entries/{id}/primary"), FileData::Bytes(entry(1, 3).primary().to_bytes()));
+    let tree = write_tree(&store.repo, &invalid).unwrap();
+    // A changed entry tree is reparsed; the stale grant cannot be reused.
+    assert!(reader.read(&store.repo, tree, previous.as_ref()).is_err());
+}
