@@ -4,6 +4,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod piv;
+mod phone;
 mod store;
 mod index;
 
@@ -21,6 +22,9 @@ pub fn execute(request: &[u8], random: Vec<u8>) -> Result<String, &'static str> 
     }
     let text = std::str::from_utf8(request).map_err(|_| "Invalid request")?;
     let parsed = store::Secret(serde_json::from_str(text).map_err(|_| "Invalid request")?);
+    if parsed.0["identity"].as_str().is_some_and(|s| s.starts_with("phone:")) {
+        return phone::execute(text, random);
+    }
     if parsed.0["identity"]
         .as_str()
         .is_some_and(|s| s.starts_with("piv:"))
@@ -66,6 +70,44 @@ pub extern "system" fn Java_org_kagitaba_android_NativeBridge_openPiv(
         )
     }))
     .unwrap_or(Err("PIV operation failed"));
+    match result {
+        Ok(value) => env
+            .byte_array_from_slice(value.as_bytes())
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        Err(message) => {
+            let _ = env.throw_new("java/lang/IllegalStateException", message);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_kagitaba_android_NativeBridge_openPhone(
+    mut env: JNIEnv,
+    _class: JClass,
+    request: JByteArray,
+    connection: jni::objects::JObject,
+) -> jbyteArray {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if env
+            .get_array_length(&request)
+            .map_err(|_| "Invalid phone request")?
+            > 4096
+        {
+            return Err("Invalid phone request");
+        }
+        let bytes = Zeroizing::new(
+            env.convert_byte_array(&request)
+                .map_err(|_| "Invalid phone request")?,
+        );
+        phone::open(
+            &mut env,
+            connection,
+            std::str::from_utf8(&bytes).map_err(|_| "Invalid phone request")?,
+        )
+    }))
+    .unwrap_or(Err("phone operation failed"));
     match result {
         Ok(value) => env
             .byte_array_from_slice(value.as_bytes())

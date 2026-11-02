@@ -28,6 +28,7 @@ open class SecureActivity : FragmentActivity() {
             }
         }
     }
+    private var credentialSelectionEpoch: Long? = null
     protected var busy = false
     private var backAction: (() -> Unit)? = null
     private val activeWork = mutableSetOf<kotlinx.coroutines.Job>()
@@ -50,7 +51,15 @@ open class SecureActivity : FragmentActivity() {
         vault = value; vault.lockListeners.add(onLock)
         vault.device.touchListeners.add(onTouch)
     }
-    override fun onDestroy() { CredentialTools.close(); vault.lockListeners.remove(onLock); vault.device.touchListeners.remove(onTouch); super.onDestroy() }
+    override fun onDestroy() { CredentialTools.close(); vault.lockListeners.remove(onLock); vault.device.touchListeners.remove(onTouch); vault.device.detach(this, vault, isFinishing && vault.unlocked && credentialSelectionEpoch == vault.epoch); super.onDestroy() }
+    /** Only a successful provider response may outlive this prompt host. */
+    protected fun finishCredentialSelection(result: android.content.Intent) {
+        check(vault.unlocked) { "Authentication expired" }
+        credentialSelectionEpoch = vault.epoch
+        setResult(RESULT_OK, result)
+        finish()
+    }
+    override fun onResume() { super.onResume(); vault.device.attach(this) }
     override fun onUserInteraction() { super.onUserInteraction(); (application as KagitabaApp).touch() }
     protected open fun locked() { screen("Wallet locked"); button("Unlock", primary = true) { authenticate { recreate() } } }
     protected open fun walletShown() = vault.connected
@@ -158,12 +167,13 @@ open class SecureActivity : FragmentActivity() {
     }
     protected fun authenticate(provision: Boolean = false, done: () -> Unit) {
         val target = vault
+        val expected = target.epoch
         work("Reading wallet participants…") {
             val candidates = if (target.connected) target.unlockCandidates() else null
-            check((application as KagitabaApp).vault === target) { "Authentication expired" }
+            check((application as KagitabaApp).vault === target && target.epoch == expected) { "Authentication expired" }
             target.device.authenticate(this@SecureActivity, candidates, provision, target, { bytes ->
-                if ((application as KagitabaApp).vault !== target) { bytes.fill(0); target.device.close() }
-                else { target.unlock(bytes); work("Opening wallet…") { target.finishUnlock(); done() } }
+                if ((application as KagitabaApp).vault !== target || !target.unlockIfCurrent(bytes, expected)) { bytes.fill(0); target.device.close() }
+                else { work("Opening wallet…") { target.finishUnlock(); done() } }
             }, { notice.text = it })
         }
     }
@@ -187,7 +197,7 @@ open class SecureActivity : FragmentActivity() {
         else -> {
             val message = e.message.orEmpty()
             // Only fixed application-owned messages; never expose native/Git/HTTP input.
-            val safe = setOf(DeviceToken.ERROR, "Wallet validation or storage failed", "Unlock your wallet first", "Remote wallet branch is missing",
+            val safe = setOf(PhoneIdentity.ERROR, DeviceToken.ERROR, "Wallet validation or storage failed", "Unlock your wallet first", "Remote wallet branch is missing",
                 "Wallet histories diverged. No changes were discarded; resolve this on your computer.", "Only ES256 passkeys are supported",
                 "This passkey extension is not supported yet", "This passkey already exists", "This app is not associated with the passkey website",
                 "Use an HTTPS Git URL without embedded credentials", "An HTTPS website is required", "Invalid or unsupported cryptographic operation",

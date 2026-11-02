@@ -8,6 +8,7 @@ object NativeBridge {
     init { System.loadLibrary("kagitaba_android") }
     @JvmStatic external fun execute(request: ByteArray, random: ByteArray): ByteArray
     @JvmStatic external fun openPiv(request: ByteArray, connection: PivTransport): ByteArray
+    @JvmStatic external fun openPhone(request: ByteArray, connection: PhoneOperations): ByteArray
     private val rng = SecureRandom()
     fun random(count: Int): ByteArray = ByteArray(count).also(rng::nextBytes)
     fun call(op: String, fields: JSONObject = JSONObject()): JSONObject {

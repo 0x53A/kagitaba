@@ -10,6 +10,10 @@ class UnlockSession(private val nextEpoch: () -> Long) {
     fun open(bytes: ByteArray) = synchronized(gate) {
         identity?.fill(0); identity = bytes; generation = nextEpoch()
     }
+    fun openIfCurrent(bytes: ByteArray, expected: Long): Boolean = synchronized(gate) {
+        if (generation != expected) { bytes.fill(0); false }
+        else { identity?.fill(0); identity = bytes; generation = nextEpoch(); true }
+    }
     fun invalidate() = synchronized(gate) {
         identity?.fill(0); identity = null; generation = nextEpoch()
     }

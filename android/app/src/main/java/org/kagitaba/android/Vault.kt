@@ -19,9 +19,7 @@ import java.net.URI
 
 class Vault(private val context: Context, private val directory: File = context.noBackupFilesDir, val walletId: String = "legacy") {
     init { directory.mkdirs() }
-    // Product-level selection: DeviceIdentity is retained, but deliberately not
-    // reachable from setup, unlock, providers, or autofill in this build.
-    val device = PivIdentity(context)
+    val device = WalletIdentity(context)
     private val gate = Any()
     private val session = UnlockSession { (context as KagitabaApp).nextEpoch() }
     val epoch get() = session.epoch
@@ -36,6 +34,7 @@ class Vault(private val context: Context, private val directory: File = context.
     val connected get() = synchronized(gate) { state.has("head") }
     fun settings(): JSONObject = synchronized(gate) { JSONObject(state.toString()).apply { remove("token"); remove("deviceToken"); put("hasDeviceToken", state.has("deviceToken")) } }
     fun unlock(bytes: ByteArray) { session.open(bytes); (context as KagitabaApp).touch() }
+    fun unlockIfCurrent(bytes: ByteArray, expected: Long): Boolean = session.openIfCurrent(bytes, expected).also { if (it) (context as KagitabaApp).touch() }
     fun lock() {
         session.invalidate()
         synchronized(gate) { snapshot = null }
@@ -46,7 +45,7 @@ class Vault(private val context: Context, private val directory: File = context.
         else android.os.Handler(android.os.Looper.getMainLooper()).post(notify)
     }
     private fun <T> secret(block: (String) -> T): T = session.use { bytes ->
-        block(if (bytes.take(4) == "piv:".toByteArray().toList()) String(bytes, Charsets.UTF_8) else b64(bytes))
+        block(if (bytes.take(4) == "piv:".toByteArray().toList() || bytes.take(6) == "phone:".toByteArray().toList()) String(bytes, Charsets.UTF_8) else b64(bytes))
     }
     private fun persist(next: JSONObject) = synchronized(gate) {
         var stream: java.io.FileOutputStream? = null
@@ -71,7 +70,7 @@ class Vault(private val context: Context, private val directory: File = context.
     private fun read(): JSONObject = request("store_open").also { snapshot = it }
     suspend fun create() = withContext(Dispatchers.IO) { operations.withLock { secret { key ->
         check(!connected) { "A wallet is already connected" }
-        accepted(request("store_create", json("identity" to key, "device" to device.publicInfo().getJSONObject("device"))))
+        accepted(request("store_create", json("identity" to key, "device" to device.publicInfo().optJSONObject("device"))))
         persist(JSONObject(state.toString()).put("createdHere", true))
     } } }
     private fun canonicalUrl(url: String): String {
@@ -123,8 +122,11 @@ class Vault(private val context: Context, private val directory: File = context.
         if (connected) requireParticipant(read())
     } } }
     private fun requireParticipant(verified: JSONObject) {
-        check(verified.getJSONObject("participants").has(device.publicInfo().getString("participantId"))) {
-            "This YubiKey participant is not enrolled in this wallet. Select its existing slots or enroll it on your computer."
+        val info = device.publicInfo()
+        val id = info.getString("participantId")
+        check(verified.getJSONObject("participants").optString(id) == info.getString("participantPem") &&
+            verified.getJSONObject("signingKeys").optString(id) == info.getString("signingPem")) {
+            "This participant is not enrolled in this wallet. Enroll it using an existing participant."
         }
     }
     suspend fun saveConnection(url: String, username: String, token: String, auto: Boolean) = withContext(Dispatchers.IO) { operations.withLock { synchronized(gate) {

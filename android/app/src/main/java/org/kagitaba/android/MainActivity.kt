@@ -60,7 +60,7 @@ class MainActivity : SecureActivity() {
                     }
                     else button("Create wallet", primary = true) { work("Creating signed wallet…") { vault.create(); home() } }
                 } else {
-                    button("Choose PIV key", primary = true) { authenticate { home() } }
+                    button("Choose phone or YubiKey", primary = true) { authenticate { home() } }
                 }
             } else {
                 connectionForm(false)
@@ -323,9 +323,14 @@ class MainActivity : SecureActivity() {
         screen("Settings") { home() }
         if (vault.unlocked) {
             val info = vault.device.publicInfo()
+            if (info.optString("backend") == "strongbox") {
+                label("Phone StrongBox · ${info.getInt("authSeconds")} second authentication window")
+                label("Participant ${info.getString("participantId")}", 14)
+            } else {
             label("Current YubiKey policies (read-only)")
             label(policyDescription("Encryption", info.optJSONObject("encryptionPolicy")))
             label(policyDescription("Signing", info.optJSONObject("signingPolicy")))
+            }
         }
         button("Repository connection") { screen("Repository connection") { settings() }; connectionForm(true) }
         button("Participant names") { participants() }

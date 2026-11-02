@@ -34,7 +34,9 @@ class ProviderActivity : SecureActivity() {
             val response = CredentialService.query(this, begin, interactive = true)
             authorized()
             val result = Intent(); PendingIntentHandler.setBeginGetCredentialResponse(result, response)
-            setResult(RESULT_OK, result); finish(); return@work
+            if (response.credentialEntries.isNotEmpty()) finishCredentialSelection(result)
+            else { setResult(RESULT_OK, result); finish() }
+            return@work
         }
         val policy = CallerPolicy(this)
         if (ticket.kind == "create") {

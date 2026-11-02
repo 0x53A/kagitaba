@@ -89,3 +89,15 @@ transient summaries when valid payloads exceed persisted cache bounds. Only
 successfully sealed indexes are written. Oversized listings leave the head,
 existing cache and wrapper unchanged and require no signing. Trust, decryption
 and signing failures retain their normal error behavior.
+
+## Phone StrongBox callback backend
+
+`openPhone` registers public P-256 keys and an application-owned PhoneOperations
+callback as a process-local `phone:<handle>`. It never receives a private scalar.
+ECDH callbacks accept only core-validated SEC1 points and must return exactly 32
+raw bytes; signing returns DER ECDSA/SHA-256. Store/index and payload validation
+reuse the shared Rust implementations. JNI clears byte arrays and Java exceptions;
+errors never forward Java exception text. `phone_close` revokes the handle and
+marks already-cloned backends inactive. The Kotlin callback owns hardware policy,
+biometric prompts, lifetime checks and timed reauthentication. Synthetic JCA
+PhoneInteropTest is not evidence of physical StrongBox support.

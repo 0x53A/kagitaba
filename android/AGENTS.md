@@ -40,11 +40,12 @@ Use the native/Firefox near-black, dark blue and cyan palette, rectangular
 owns the roles. Keep setup, entries and settings in focused screens with Back;
 Lock stays in the header during private work. Remove decorative copy while
 retaining trust, hardware consent and destructive-action explanations.
-The active backend is the existing
-YubiKey PIV participant. `Vault.device` selects `PivIdentity` at the application
-layer. `DeviceIdentity` and its Keystore implementation remain intact but are
-unreachable from setup/unlock/provider/autofill; no phone participant is generated.
-Existing device identity files are preserved, not migrated or deleted.
+The backend chooser supports YubiKey PIV and a phone StrongBox participant.
+`Vault.device` selects through `WalletIdentity`; `PhoneIdentity` generates separate
+non-exportable P-256 ECDH/signing keys. See `STRONGBOX-DESIGN.md` for enrollment,
+fixed configurable authentication windows (60 seconds by default), batch
+reauthentication, cancellation, and recovery. No software/TEE fallback is allowed.
+`DeviceIdentity` remains unreachable; legacy software identity files are preserved.
 
 Private operations use an `UnlockSession` epoch lease outside the lock monitor.
 Lock invalidates the lease immediately and suppresses late results. PIV transport
@@ -103,7 +104,7 @@ JNI holds a process-local handle to the shared Rust `kagitaba-device::Session`;
 its private operations call the Android transport via a GlobalRef. Core ECDH
 unwrap, payload encryption and wallet signing all remain Rust. Native desktop USB
 is an optional default-on `kagitaba-device/usb` feature, disabled for Android.
-Provider requests require fresh PIV PIN entry. Background provider enumeration
+Provider requests require foreground backend authentication. Background provider enumeration
 returns an authentication action and never triggers hidden hardware touches.
 Provider/autofill saves perform optional synchronization in the foreground before
 closing the activity. Git token access uses device storage, not a PIV touch.
@@ -426,3 +427,21 @@ path per direct membership, derived from readable collection index hints. Ancest
 names provide the path, not implied parent membership. Multiple roots and nested
 memberships are retained; inaccessible collections are not inferred. This display
 requires no additional key operation and does not authorize access.
+
+Phone StrongBox implementation and validation boundaries: `STRONGBOX-DESIGN.md`.
+Phone keys can create a wallet or export enrollment requests; connected wallets
+match both public keys before unlock. Keep synthetic callback validation separate
+from actual StrongBox/authentication-policy validation on a Pixel.
+
+StrongBox checks: PhoneInteropTest and PhoneEnrollmentTest use synthetic data;
+PhoneAuthenticationTest requires a disposable emulator with PIN 123456 and tests
+actual timed Keystore/device-credential authorization without claiming StrongBox.
+All UI/PIN tests refuse physical hardware. See the design document for boundaries.
+
+A phone-backed Credential Manager unlock activity may preserve its session only
+when returning nonempty credential choices successfully, using SecureActivity's
+epoch-bound finishCredentialSelection marker. Prompt-host detach then cancels
+prompts without clearing the returned one-shot tickets. All other destruction,
+explicit lock, screen-off and idle expiry keep normal revocation. Selection still
+requires fresh foreground authentication. PhoneProviderHandoffTest exercises this
+two-stage handoff with synthetic keys and actual activity/PendingIntent plumbing.
