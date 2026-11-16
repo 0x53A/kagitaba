@@ -1,4 +1,3 @@
-use gix::refs::transaction::PreviousValue;
 use kagitaba_core::{
     crypto::{PublicKey, SoftwareIdentity},
     wallet::Wallet,
@@ -124,6 +123,23 @@ fn git(path: &std::path::Path, args: &[&str]) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
+}
+
+fn set_test_head(path: &std::path::Path, id: gix::ObjectId, message: &str) {
+    git(
+        path,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@localhost",
+            "update-ref",
+            "-m",
+            message,
+            "refs/heads/wallet",
+            &id.to_string(),
+        ],
+    );
 }
 
 #[test]
@@ -423,14 +439,7 @@ fn persists_signed_snapshots_and_rejects_stale_writes_and_rollback() {
     assert!(matches!(b.save(s, &key, "Stale"), Err(Error::Stale)));
     let latest = a.head;
     assert!(Store::open(dir.path(), key.public.clone(), Some(latest)).is_ok());
-    let repo = gix::open(dir.path()).unwrap();
-    repo.reference(
-        "refs/heads/wallet",
-        root,
-        PreviousValue::Any,
-        "test rollback",
-    )
-    .unwrap();
+    set_test_head(dir.path(), root, "test rollback");
     assert!(matches!(
         Store::open(dir.path(), key.public, Some(latest)),
         Err(Error::Checkpoint)
@@ -467,21 +476,14 @@ fn unsigned_and_duplicate_parent_commits_are_rejected() {
     c.parents.push(store.head);
     c.extra_headers.clear();
     let unsigned = repo.write_object(c.clone()).unwrap().detach();
-    repo.reference(
-        "refs/heads/wallet",
-        unsigned,
-        PreviousValue::Any,
-        "unsigned",
-    )
-    .unwrap();
+    set_test_head(dir.path(), unsigned, "unsigned");
     assert!(matches!(
         Store::open(dir.path(), key.public.clone(), None),
         Err(Error::Signature)
     ));
     c.parents.push(store.head);
     let merge = repo.write_object(c).unwrap().detach();
-    repo.reference("refs/heads/wallet", merge, PreviousValue::Any, "merge")
-        .unwrap();
+    set_test_head(dir.path(), merge, "merge");
     assert!(matches!(
         Store::open(dir.path(), key.public, None),
         Err(Error::History)
